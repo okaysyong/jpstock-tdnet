@@ -23,13 +23,10 @@ RSS_FEEDS = [
     ("nhk_eco",   "https://www.nhk.or.jp/rss/news/cat6.xml"),   # 경제
     ("nhk_world", "https://www.nhk.or.jp/rss/news/cat4.xml"),   # 국제
     ("nhk_top",   "https://www.nhk.or.jp/rss/news/cat0.xml"),   # 주요
-    ("nhk_tech",  "https://www.nhk.or.jp/rss/news/cat3.xml"),   # 과학/기술
     ("nhk_biz",   "https://www.nhk.or.jp/rss/news/cat5.xml"),   # 정치
+    ("nhk_sci",   "https://www.nhk.or.jp/rss/news/cat7.xml"),   # 과학/문화
     # Yahoo Finance JP
     ("yahoo_fin", "https://finance.yahoo.co.jp/rss/news"),
-    # Investing.com JP (일본 주식/경제만, 외환 제외)
-    ("inv_stock", "https://jp.investing.com/rss/news_14.rss"),  # 주식
-    ("inv_econ",  "https://jp.investing.com/rss/news_301.rss"), # 경제
 ]
 
 # 제외 키워드
