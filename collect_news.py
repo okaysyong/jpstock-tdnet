@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 import xml.etree.ElementTree as ET
 
-VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "https://jpstocklive.com/api")
+VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "")
 
 JST = timezone(timedelta(hours=9))
 
