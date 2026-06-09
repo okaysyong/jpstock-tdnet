@@ -2,8 +2,8 @@ name: News Collect
 
 on:
   schedule:
-    # 30분마다 24시간 (UTC 기준)
-    - cron: '*/30 * * * *'
+    # 5분마다 24시간
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
