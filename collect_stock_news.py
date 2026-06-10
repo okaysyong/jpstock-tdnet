@@ -181,12 +181,21 @@ def fetch_kabutan_market_news() -> List[dict]:
     results = []
     today = datetime.now(JST).strftime("%Y-%m-%d")
 
+    # 디버그: HTML 크기 및 앞부분 확인
+    print(f"  [디버그] HTML 크기: {len(html)}bytes")
+    # 카부탄 뉴스 링크 존재 여부 확인
+    news_links = re.findall(r'href="(/news/[^"]+)"', html)
+    print(f"  [디버그] /news/ 링크 수: {len(news_links)}")
+    if news_links:
+        print(f"  [디버그] 링크 예시: {news_links[:3]}")
+
     # 패턴 1: <dt>시각</dt><dd><a href>제목</a>
     items = re.findall(
         r'<dt[^>]*>\s*([^<]*\d{1,2}:\d{2}[^<]*)\s*</dt>\s*<dd[^>]*>.*?'
         r'<a[^>]+href="(/news/[^"]+)"[^>]*>([^<]+)</a>',
         html, re.DOTALL
     )
+    print(f"  [디버그] 패턴1 매칭: {len(items)}건")
 
     # 패턴 2: href와 제목 직접 추출
     if not items:
