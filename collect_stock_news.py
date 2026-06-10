@@ -6,9 +6,9 @@ GitHub Actions에서 실행 (5분마다)
 카부탄 종목별 뉴스 + 시장 뉴스 수집 → VPS /push/stock_news 전송
 
 수집 소스:
-  1. 카부탄 시장 뉴스 (marketnews)         → 시장 전체 재료
-  2. 카부탄 거래대금 상위 종목별 뉴스        → 종목 개별 재료
-  3. 카부탄 테마주 뉴스                    → 섹터/테마 재료
+  1. 카부탄 시장 뉴스 (marketnews)
+  2. 카부탄 거래대금 상위 종목별 뉴스
+  3. 카부탄 테마주 뉴스
 
 VPS 수신: POST https://jpstocklive.com/push/stock_news
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -23,7 +23,14 @@ import hashlib
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
+from typing import List, Optional
+
+# requests 사용 (GitHub Actions 기본 포함)
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 # ── 설정 ────────────────────────────────────────────────
 VPS_URL    = os.environ.get("VPS_URL", "https://jpstocklive.com")
@@ -31,18 +38,24 @@ VPS_SECRET = os.environ.get("VPS_SECRET", "")
 
 JST = timezone(timedelta(hours=9))
 
+# 카부탄 차단 우회용 헤더 (실제 브라우저와 최대한 동일하게)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "ja,en;q=0.9,ko;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
 }
 
-# 거래대금 상위 종목 (Yahoo Finance JP에서 매일 갱신, 없으면 기본값 사용)
-# GitHub Actions에서 환경변수로 전달받거나 하드코딩 fallback 사용
 DEFAULT_TOP_CODES = [
     "8306",  # 三菱UFJ
     "9984",  # ソフトバンクG
@@ -66,22 +79,14 @@ DEFAULT_TOP_CODES = [
     "4568",  # 第一三共
 ]
 
-# 뉴스 필터링 - 제외 키워드 (주식시장 무관 뉴스)
 _EXCLUDE_KEYWORDS = [
-    # 스포츠
     "野球", "サッカー", "バスケット", "テニス", "ゴルフスコア",
-    "オリンピック競技", "ワールドカップ試合",
-    # 엔터테인먼트
     "芸能", "タレント", "アイドル", "ドラマ", "映画公開",
-    # 황실/정치 일반
-    "天皇", "皇室", "皇后", "憲法改正議論", "参議院選挙",
-    # 사회면
-    "事件", "事故", "災害", "地震速報", "台風",
-    # 암호화폐 (개별)
-    "ビットコイン急騰", "仮想通貨急落", "NFT販売",
+    "天皇", "皇室", "憲法改正議論",
+    "交通事故", "火災", "逮捕",
+    "ビットコイン急騰", "仮想通貨急落",
 ]
 
-# 중요도 판별 키워드
 _HIGH_IMPACT = [
     "業績修正", "上方修正", "下方修正", "決算", "TOB", "買収",
     "増資", "自社株買い", "配当修正", "社長交代", "合併", "分割",
@@ -93,46 +98,22 @@ _MEDIUM_IMPACT = [
     "輸出", "輸入", "価格", "需要", "供給", "市況",
 ]
 
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 유틸리티
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _clean_html(s: str) -> str:
-    """HTML 태그 제거"""
     s = re.sub(r'<[^>]+>', '', s)
-    s = re.sub(r'\s+', ' ', s)
-    return s.strip()
+    return re.sub(r'\s+', ' ', s).strip()
 
 def _make_id(code: str, title: str, date: str) -> str:
-    """뉴스 고유 ID 생성"""
     raw = f"{code}_{title}_{date}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 def _jst_now() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M")
 
-def _fetch_url(url: str, timeout: int = 10) -> Optional[str]:
-    """URL fetch (urllib 사용 - requests 없이)"""
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            charset = "utf-8"
-            ct = r.headers.get("Content-Type", "")
-            if "charset=" in ct:
-                charset = ct.split("charset=")[-1].strip()
-            return r.read().decode(charset, errors="ignore")
-    except Exception as e:
-        print(f"  [fetch] {url[:60]}... 실패: {e}")
-        return None
-
 def _classify_importance(title: str) -> int:
-    """
-    뉴스 중요도 분류
-    3: 고중요 (결산/수정/TOB 등)
-    2: 중중요
-    1: 일반
-    """
     for kw in _HIGH_IMPACT:
         if kw in title:
             return 3
@@ -142,22 +123,55 @@ def _classify_importance(title: str) -> int:
     return 1
 
 def _is_excluded(title: str) -> bool:
-    """제외 대상 뉴스 여부"""
-    for kw in _EXCLUDE_KEYWORDS:
-        if kw in title:
-            return True
-    return False
+    return any(kw in title for kw in _EXCLUDE_KEYWORDS)
+
+# requests 세션 (재사용으로 연결 효율 향상)
+_session = None
+
+def _get_session():
+    global _session
+    if _session is None:
+        if HAS_REQUESTS:
+            _session = requests.Session()
+            _session.headers.update(HEADERS)
+        else:
+            _session = False
+    return _session
+
+def _fetch_url(url: str, timeout: int = 12) -> Optional[str]:
+    """URL fetch — requests 우선, urllib 폴백"""
+    sess = _get_session()
+
+    # requests 사용
+    if sess:
+        try:
+            r = sess.get(url, timeout=timeout, allow_redirects=True)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding or "utf-8"
+            return r.text
+        except Exception as e:
+            print(f"  [fetch] {url[:70]}... 실패: {e}")
+            return None
+
+    # urllib 폴백
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            charset = "utf-8"
+            ct = r.headers.get("Content-Type", "")
+            if "charset=" in ct:
+                charset = ct.split("charset=")[-1].strip()
+            return r.read().decode(charset, errors="ignore")
+    except Exception as e:
+        print(f"  [fetch] {url[:70]}... 실패: {e}")
+        return None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1. 카부탄 시장 뉴스 (marketnews)
+# 1. 카부탄 시장 뉴스
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def fetch_kabutan_market_news() -> List[dict]:
-    """
-    카부탄 시장 뉴스 수집
-    https://kabutan.jp/news/marketnews/
-    """
     print("[카부탄] 시장 뉴스 수집 중...")
     url = "https://kabutan.jp/news/marketnews/"
     html = _fetch_url(url)
@@ -167,52 +181,50 @@ def fetch_kabutan_market_news() -> List[dict]:
     results = []
     today = datetime.now(JST).strftime("%Y-%m-%d")
 
-    # 뉴스 목록 파싱
-    # 구조: <div class="news_list"> ... <dl> ... <dt>시각</dt><dd><a href="/news/...">제목</a>
+    # 패턴 1: <dt>시각</dt><dd><a href>제목</a>
     items = re.findall(
-        r'<dt[^>]*>([^<]*\d{2}:\d{2}[^<]*)</dt>\s*<dd[^>]*>.*?<a[^>]+href="(/news/[^"]+)"[^>]*>([^<]+)</a>',
+        r'<dt[^>]*>\s*([^<]*\d{1,2}:\d{2}[^<]*)\s*</dt>\s*<dd[^>]*>.*?'
+        r'<a[^>]+href="(/news/[^"]+)"[^>]*>([^<]+)</a>',
         html, re.DOTALL
     )
 
-    # 대안 파싱: 테이블 구조
+    # 패턴 2: href와 제목 직접 추출
     if not items:
-        items_alt = re.findall(
-            r'href="(/news/marketnews/\?[^"]+)"[^>]*>([^<]{5,80})</a>.*?<span[^>]*>(\d{1,2}:\d{2})',
-            html, re.DOTALL
+        items2 = re.findall(
+            r'href="(/news/marketnews/\?[^"]+)"[^>]*>\s*([^<]{5,80})\s*</a>',
+            html
         )
-        for href, title, t in items_alt[:30]:
-            title = _clean_html(title).strip()
+        for href, title in items2[:30]:
+            title = _clean_html(title)
             if not title or _is_excluded(title):
                 continue
-            news_id = _make_id("market", title, today)
             results.append({
-                "id":         news_id,
+                "id":         _make_id("market", title, today),
                 "code":       "",
                 "company":    "",
                 "title":      title,
                 "url":        f"https://kabutan.jp{href}",
-                "time":       t,
+                "time":       "",
                 "date":       today,
                 "source":     "kabutan_market",
                 "importance": _classify_importance(title),
                 "fetched_at": _jst_now(),
             })
-        print(f"  → 시장뉴스 {len(results)}건 (대안파싱)")
+        print(f"  → 시장뉴스 {len(results)}건 (패턴2)")
         return results
 
     for t, href, title in items[:30]:
-        t = _clean_html(t).strip()
-        title = _clean_html(title).strip()
+        title = _clean_html(title)
         if not title or _is_excluded(title):
             continue
-        news_id = _make_id("market", title, today)
+        time_str = t.strip()[-5:] if len(t.strip()) >= 5 else t.strip()
         results.append({
-            "id":         news_id,
+            "id":         _make_id("market", title, today),
             "code":       "",
             "company":    "",
             "title":      title,
             "url":        f"https://kabutan.jp{href}",
-            "time":       t[-5:] if len(t) >= 5 else t,
+            "time":       time_str,
             "date":       today,
             "source":     "kabutan_market",
             "importance": _classify_importance(title),
@@ -228,12 +240,8 @@ def fetch_kabutan_market_news() -> List[dict]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def fetch_kabutan_stock_news(code: str) -> List[dict]:
-    """
-    특정 종목의 카부탄 뉴스 수집
-    https://kabutan.jp/stock/news/?code=XXXX
-    """
     url = f"https://kabutan.jp/stock/news/?code={code}"
-    html = _fetch_url(url, timeout=8)
+    html = _fetch_url(url, timeout=10)
     if not html:
         return []
 
@@ -241,29 +249,34 @@ def fetch_kabutan_stock_news(code: str) -> List[dict]:
     today = datetime.now(JST).strftime("%Y-%m-%d")
 
     # 회사명 추출
-    company_m = re.search(r'<h1[^>]*class="[^"]*stockname[^"]*"[^>]*>([^<]+)', html)
-    company = _clean_html(company_m.group(1)) if company_m else ""
+    company_m = re.search(
+        r'<h2[^>]*class="[^"]*company_name[^"]*"[^>]*>([^<]+)|'
+        r'<title>([^<（(]+)[（(]',
+        html
+    )
+    company = ""
+    if company_m:
+        company = _clean_html(company_m.group(1) or company_m.group(2) or "")
 
-    # 뉴스 목록 파싱
-    # 구조: <table class="news_table"> <tr> <td>날짜시각</td> <td>분류</td> <td><a href>제목</a></td>
+    # 뉴스 행 파싱: 날짜시각 | 분류 | 제목링크
     rows = re.findall(
-        r'<tr[^>]*>\s*<td[^>]*>(\d{2}/\d{2}\s+\d{2}:\d{2})</td>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*><a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
+        r'<tr[^>]*>\s*<td[^>]*>(\d{2}/\d{2}\s+\d{2}:\d{2})</td>\s*'
+        r'<td[^>]*>([^<]*)</td>\s*<td[^>]*><a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
         html, re.DOTALL
     )
 
-    # 대안 파싱
     if not rows:
-        rows_alt = re.findall(
-            r'<a[^>]+href="(/news/[^"]+)"[^>]*>([^<]{5,100})</a>',
+        # 폴백: a 태그 직접 추출
+        links = re.findall(
+            r'<a[^>]+href="(/news/[^"?]+)"[^>]*>([^<]{5,100})</a>',
             html
         )
-        for href, title in rows_alt[:10]:
-            title = _clean_html(title).strip()
+        for href, title in links[:8]:
+            title = _clean_html(title)
             if not title or len(title) < 5 or _is_excluded(title):
                 continue
-            news_id = _make_id(code, title, today)
             results.append({
-                "id":         news_id,
+                "id":         _make_id(code, title, today),
                 "code":       code,
                 "company":    company,
                 "title":      title,
@@ -276,35 +289,30 @@ def fetch_kabutan_stock_news(code: str) -> List[dict]:
             })
         return results[:5]
 
-    for dt, category, href, title in rows[:8]:
-        title = _clean_html(title).strip()
-        category = _clean_html(category).strip()
+    for dt_str, category, href, title in rows[:8]:
+        title = _clean_html(title)
         if not title or _is_excluded(title):
             continue
-
-        # 날짜 파싱: "06/10 09:35" → "2026-06-10"
         try:
-            mm, dd = dt[:5].split("/")
+            mm, rest = dt_str.strip().split("/")
+            dd, time_str = rest.strip().split(" ")
             year = datetime.now(JST).year
             date_str = f"{year}-{mm}-{dd}"
-            time_str = dt[6:].strip()
         except Exception:
             date_str = today
             time_str = ""
 
-        news_id = _make_id(code, title, date_str)
         full_url = href if href.startswith("http") else f"https://kabutan.jp{href}"
-
         results.append({
-            "id":         news_id,
+            "id":         _make_id(code, title, date_str),
             "code":       code,
             "company":    company,
             "title":      title,
             "url":        full_url,
-            "time":       time_str,
+            "time":       time_str.strip(),
             "date":       date_str,
             "source":     "kabutan_stock",
-            "category":   category,
+            "category":   _clean_html(category),
             "importance": _classify_importance(title),
             "fetched_at": _jst_now(),
         })
@@ -313,24 +321,19 @@ def fetch_kabutan_stock_news(code: str) -> List[dict]:
 
 
 def fetch_all_stock_news(codes: List[str]) -> List[dict]:
-    """거래대금 상위 종목 전체 뉴스 수집"""
     print(f"[카부탄] 종목별 뉴스 수집 중... ({len(codes)}종목)")
     all_news = []
     seen_ids = set()
 
     for i, code in enumerate(codes):
         items = fetch_kabutan_stock_news(code)
-        new_items = []
-        for item in items:
-            if item["id"] not in seen_ids:
-                seen_ids.add(item["id"])
-                new_items.append(item)
+        new_items = [x for x in items if x["id"] not in seen_ids]
+        for x in new_items:
+            seen_ids.add(x["id"])
         all_news.extend(new_items)
         print(f"  [{i+1:02d}/{len(codes)}] {code}: {len(new_items)}건")
-
-        # 서버 부하 방지 (0.5초 간격)
         if i < len(codes) - 1:
-            time.sleep(0.5)
+            time.sleep(0.8)
 
     print(f"  → 종목뉴스 합계 {len(all_news)}건")
     return all_news
@@ -341,10 +344,6 @@ def fetch_all_stock_news(codes: List[str]) -> List[dict]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def fetch_kabutan_theme_news() -> List[dict]:
-    """
-    카부탄 테마주 뉴스 수집
-    https://kabutan.jp/news/marketnews/?category=theme
-    """
     print("[카부탄] 테마주 뉴스 수집 중...")
     url = "https://kabutan.jp/news/marketnews/?category=theme"
     html = _fetch_url(url)
@@ -353,25 +352,22 @@ def fetch_kabutan_theme_news() -> List[dict]:
 
     results = []
     today = datetime.now(JST).strftime("%Y-%m-%d")
+    seen = set()
 
     items = re.findall(
-        r'<a[^>]+href="(/news/marketnews/[^"?]+)"[^>]*>([^<]{8,100})</a>',
+        r'href="(/news/marketnews/[^"?]+)"[^>]*>\s*([^<]{8,100})\s*</a>',
         html
     )
-
-    seen = set()
     for href, title in items[:20]:
-        title = _clean_html(title).strip()
+        title = _clean_html(title)
         if not title or title in seen or _is_excluded(title):
             continue
-        # 테마 관련 키워드만
         if not any(k in title for k in ["テーマ", "関連株", "関連銘柄", "セクター",
                                           "材料", "注目", "急騰", "ランキング"]):
             continue
         seen.add(title)
-        news_id = _make_id("theme", title, today)
         results.append({
-            "id":         news_id,
+            "id":         _make_id("theme", title, today),
             "code":       "",
             "company":    "",
             "title":      title,
@@ -392,9 +388,6 @@ def fetch_kabutan_theme_news() -> List[dict]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def push_to_vps(news_items: List[dict]) -> bool:
-    """
-    수집한 뉴스를 VPS /push/stock_news 로 전송
-    """
     if not news_items:
         print("[VPS] 전송할 뉴스 없음")
         return True
@@ -412,38 +405,34 @@ def push_to_vps(news_items: List[dict]) -> bool:
         }
     }
 
+    sess = _get_session()
+    if sess:
+        try:
+            r = sess.post(url, json=payload, timeout=15)
+            r.raise_for_status()
+            print(f"[VPS] 전송 완료: {r.json()}")
+            return True
+        except Exception as e:
+            print(f"[VPS] 전송 실패: {e}")
+            return False
+
+    # urllib 폴백
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            **HEADERS,
-            "Content-Type": "application/json; charset=utf-8",
-            "Content-Length": str(len(data)),
-        },
+        url, data=data,
+        headers={**HEADERS, "Content-Type": "application/json; charset=utf-8"},
         method="POST"
     )
-
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            resp = json.loads(r.read().decode())
-            print(f"[VPS] 전송 완료: {resp}")
+            print(f"[VPS] 전송 완료: {json.loads(r.read().decode())}")
             return True
     except Exception as e:
         print(f"[VPS] 전송 실패: {e}")
         return False
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 거래대금 상위 종목 코드 가져오기 (환경변수 or 기본값)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def get_top_codes() -> List[str]:
-    """
-    환경변수 TOP_CODES에서 종목 코드 가져오기
-    없으면 DEFAULT_TOP_CODES 사용
-    형식: "6857,8035,9984,..."
-    """
     env_codes = os.environ.get("TOP_CODES", "")
     if env_codes:
         codes = [c.strip() for c in env_codes.split(",") if c.strip()]
@@ -462,27 +451,23 @@ def main():
     start = time.time()
     now_jst = datetime.now(JST)
     print(f"━━━ 카부탄 종목뉴스 수집 시작 {now_jst.strftime('%Y-%m-%d %H:%M JST')} ━━━")
+    print(f"requests 라이브러리: {'✅ 사용' if HAS_REQUESTS else '❌ urllib 폴백'}")
 
-    # 수집 대상 종목
     codes = get_top_codes()
-
     all_news = []
 
-    # 1. 시장 뉴스
     market_news = fetch_kabutan_market_news()
     all_news.extend(market_news)
-    time.sleep(0.5)
+    time.sleep(1)
 
-    # 2. 종목별 뉴스
     stock_news = fetch_all_stock_news(codes)
     all_news.extend(stock_news)
-    time.sleep(0.5)
+    time.sleep(1)
 
-    # 3. 테마주 뉴스
     theme_news = fetch_kabutan_theme_news()
     all_news.extend(theme_news)
 
-    # 중복 제거 (ID 기준)
+    # 중복 제거
     seen_ids = set()
     unique_news = []
     for item in all_news:
@@ -490,21 +475,17 @@ def main():
             seen_ids.add(item["id"])
             unique_news.append(item)
 
-    # 중요도 내림차순 정렬
-    unique_news.sort(key=lambda x: (-x["importance"], x.get("date", ""), x.get("time", "")))
+    unique_news.sort(key=lambda x: (-x["importance"], x.get("date",""), x.get("time","")))
 
     elapsed = time.time() - start
     print(f"\n━━━ 수집 완료 ━━━")
     print(f"  총 뉴스: {len(unique_news)}건")
-    print(f"  중요도3: {len([n for n in unique_news if n['importance'] == 3])}건")
-    print(f"  중요도2: {len([n for n in unique_news if n['importance'] == 2])}건")
-    print(f"  중요도1: {len([n for n in unique_news if n['importance'] == 1])}건")
+    print(f"  중요도3: {len([n for n in unique_news if n['importance']==3])}건")
+    print(f"  중요도2: {len([n for n in unique_news if n['importance']==2])}건")
+    print(f"  중요도1: {len([n for n in unique_news if n['importance']==1])}건")
     print(f"  소요시간: {elapsed:.1f}초")
 
-    # VPS 전송
-    success = push_to_vps(unique_news)
-
-    if not success:
+    if not push_to_vps(unique_news):
         print("[오류] VPS 전송 실패")
         sys.exit(1)
 
