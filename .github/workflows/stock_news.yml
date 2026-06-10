@@ -2,15 +2,13 @@ name: Kabutan Stock News Collector
 
 on:
   schedule:
-    # 일본장 시간 (JST 09:00~15:30 = UTC 00:00~06:30) — 5분마다
     - cron: '0,5,10,15,20,25,30,35,40,45,50,55 0-6 * * 1-5'
-    # 미국장 시간 (JST 22:30~05:00 = UTC 13:30~20:00) — 30분마다
     - cron: '0,30 13-20 * * 1-5'
 
   workflow_dispatch:
     inputs:
       top_codes:
-        description: '종목 코드 (쉼표구분, 예: 6857,8035,9984)'
+        description: '종목 코드 (쉼표구분)'
         required: false
         default: ''
 
@@ -28,15 +26,16 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Run stock news collector
         env:
           VPS_URL: "https://jpstocklive.com"
           VPS_SECRET: ""
           TOP_CODES: ${{ github.event.inputs.top_codes }}
-        run: |
-          python collect_stock_news.py
+        run: python collect_stock_news.py
 
       - name: Report result
         if: always()
-        run: |
-          echo "완료: $(date '+%Y-%m-%d %H:%M UTC')"
+        run: echo "완료: $(date '+%Y-%m-%d %H:%M UTC')"
