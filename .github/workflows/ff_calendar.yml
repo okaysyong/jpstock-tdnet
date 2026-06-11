@@ -18,7 +18,6 @@ jobs:
           from bs4 import BeautifulSoup
 
           JST = timezone(timedelta(hours=9))
-          today_str = datetime.now(JST).strftime("%-m/%-d")  # "6/11" 형식
           year = datetime.now(JST).year
 
           headers = {
@@ -26,114 +25,106 @@ jobs:
               "Accept-Language": "ja,en-US;q=0.9",
           }
 
-          # ── 1. nikkei225jp.com 스크래핑 → actual 맵 ──
-          nk_events = []  # [{date, time, title, actual, forecast, previous, currency, stars}]
+          # 통화 판단 키워드
+          USD_KW = ["米","FRB","FOMC","ISM","NFP","MBA","ダウ","ナスダック","連邦","財務省","ADP",
+                    "CPI","PPI","GDP","PCE","PMI","ISM","雇用統計","消費者信頼","住宅着工",
+                    "小売売上","貿易収支","鉱工業生産指数（米）","Fed","Dollar"]
+          JPY_KW = ["日銀","日本","国内","日経","円","BOJ","短観","景況","対外","対内","設備稼働",
+                    "鉱工業生産[","生産者物価","消費者物価（日","RICS","BSI","機械受注"]
+
+          def guess_currency(title, img_src=""):
+              """제목/이미지로 통화 판단"""
+              src = img_src.lower()
+              if "us_" in src or "usa" in src or "america" in src or "dollar" in src:
+                  return "USD"
+              if "jp_" in src or "japan" in src or "yen" in src:
+                  return "JPY"
+              # 제목 키워드
+              for kw in USD_KW:
+                  if kw in title:
+                      return "USD"
+              for kw in JPY_KW:
+                  if kw in title:
+                      return "JPY"
+              # 영어 제목 → 대부분 USD
+              if re.search(r'[A-Z]{2,}', title):
+                  return "USD"
+              return "JPY"  # 기본값
+
+          # ── nikkei225jp.com 스크래핑 ──
+          nk_events = []
           try:
               r = requests.get("https://nikkei225jp.com/schedule/", headers=headers, timeout=15)
               print(f"nikkei225jp: {r.status_code}")
               if r.status_code == 200:
                   soup = BeautifulSoup(r.text, "html.parser")
-                  tables = soup.find_all("table")
-                  
-                  # 두 번째 테이블 (90행짜리)
                   main_table = None
-                  for t in tables:
-                      rows = t.find_all("tr")
-                      if len(rows) > 10:
+                  for t in soup.find_all("table"):
+                      if len(t.find_all("tr")) > 10:
                           main_table = t
                           break
-                  
+
                   if main_table:
                       current_date = None
-                      current_year = year
-                      rows = main_table.find_all("tr")
-                      for row in rows:
+                      for row in main_table.find_all("tr"):
                           cells = row.find_all(["td","th"])
                           texts = [c.get_text(strip=True) for c in cells]
                           if not texts:
                               continue
-                          
-                          # 날짜 행: "06/10(水)" 형식
+
+                          # 날짜 행
                           if len(texts) == 1 and re.match(r'\d+/\d+', texts[0]):
                               m = re.match(r'(\d+)/(\d+)', texts[0])
                               if m:
-                                  current_date = f"{current_year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+                                  current_date = f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
                               continue
-                          
-                          # 데이터 행: 시간 | 중요도 | 지표명 | 결과 | 예상 | 전회
+
+                          # 데이터 행
                           if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]):
-                              time_str  = texts[0]  # "08:50"
-                              stars_raw = texts[1]  # "★★★"
-                              title     = texts[2]  # "05月 CPI..."
-                              actual    = texts[3]  # "4.2%"
-                              forecast  = texts[4]  # "4.1%"
-                              previous  = texts[5]  # "3.8%"
-                              
-                              stars = stars_raw.count("★")
-                              
-                              # 통화 판단: 🇯🇵/🇺🇸 이미지 또는 텍스트에서
+                              time_str = texts[0]
+                              stars    = texts[1].count("★")
+                              title    = texts[2]
+                              actual   = texts[3]
+                              forecast = texts[4]
+                              previous = texts[5]
+
+                              # 이미지 src로 통화 판단
                               img = cells[2].find("img") if len(cells) > 2 else None
-                              src = img.get("src","") if img else ""
-                              if "us" in src.lower() or "america" in src.lower():
-                                  currency = "USD"
-                              elif "jp" in src.lower() or "japan" in src.lower():
-                                  currency = "JPY"
-                              else:
-                                  # 제목으로 판단
-                                  currency = "USD" if any(k in title for k in ["米","FRB","FOMC","ISM","NFP","MBA"]) else "JPY"
-                              
+                              img_src = img.get("src","") if img else ""
+                              currency = guess_currency(title, img_src)
+
                               if current_date and stars >= 2:
                                   nk_events.append({
-                                      "date": current_date,
-                                      "time": time_str,
-                                      "title": title,
-                                      "actual": actual,
-                                      "forecast": forecast,
-                                      "previous": previous,
-                                      "currency": currency,
-                                      "stars": stars,
+                                      "date": current_date, "time": time_str,
+                                      "title": title, "actual": actual,
+                                      "forecast": forecast, "previous": previous,
+                                      "currency": currency, "stars": stars,
                                   })
-                      
-                      print(f"nikkei225jp 파싱: {len(nk_events)}건 (★★ 이상)")
-                      # 샘플 출력
-                      for ev in nk_events[:5]:
-                          print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:25]} | actual={ev['actual']} forecast={ev['forecast']}")
+
+                  print(f"파싱: {len(nk_events)}건")
+                  # 통화 분포 확인
+                  usd = sum(1 for e in nk_events if e["currency"]=="USD")
+                  jpy = sum(1 for e in nk_events if e["currency"]=="JPY")
+                  print(f"  USD:{usd} JPY:{jpy}")
+                  for ev in nk_events[:5]:
+                      print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:25]} | actual={ev['actual']}")
+
           except Exception as e:
               print(f"nikkei225jp error: {e}")
               import traceback; traceback.print_exc()
 
-          # ── 2. ForexFactory JSON (일정/시간 보완) ──
+          # ── ForexFactory JSON (미래 일정 보완) ──
           ff_items = []
-          ff_headers = {"User-Agent": "Mozilla/5.0"}
           for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
                       "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
               try:
-                  res = requests.get(url, headers=ff_headers, timeout=15)
+                  res = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
                   if res.status_code == 200:
                       ff_items.extend(res.json())
-                      print(f"FF OK {url.split('/')[-1]}: {len(res.json())}건")
+                      print(f"FF {url.split('/')[-1]}: {len(res.json())}건")
               except Exception as e:
                   print(f"FF error: {e}")
 
-          # ── 3. nikkei225jp + ForexFactory 머지 ──
-          # nikkei225jp를 기준으로, FF에서 없는 미래 일정 보완
-          push_items = []
-
-          # nikkei225jp 데이터 → push
-          for ev in nk_events:
-              impact = "High" if ev["stars"] >= 4 else "Medium"
-              push_items.append({
-                  "title":    ev["title"],
-                  "currency": ev["currency"],
-                  "impact":   impact,
-                  "date":     ev["date"],
-                  "time":     ev["time"],
-                  "forecast": ev["forecast"],
-                  "previous": ev["previous"],
-                  "actual":   ev["actual"],
-              })
-
-          # FF에서 nikkei225jp에 없는 미래 일정 추가
           def parse_jst(s):
               try:
                   dt = datetime.fromisoformat(s).astimezone(JST)
@@ -141,6 +132,18 @@ jobs:
               except:
                   return s[:10], "00:00"
 
+          # nikkei225jp → push
+          push_items = []
+          for ev in nk_events:
+              impact = "High" if ev["stars"] >= 4 else "Medium"
+              push_items.append({
+                  "title": ev["title"], "currency": ev["currency"],
+                  "impact": impact, "date": ev["date"], "time": ev["time"],
+                  "forecast": ev["forecast"], "previous": ev["previous"],
+                  "actual": ev["actual"],
+              })
+
+          # FF 미래 일정 보완 (nikkei225jp에 없는 것)
           nk_keys = {(ev["date"], ev["time"][:5]) for ev in nk_events}
           for ev in ff_items:
               if ev.get("country") not in ("USD","JPY"): continue
@@ -148,18 +151,14 @@ jobs:
               d, t = parse_jst(ev.get("date",""))
               if (d, t) not in nk_keys:
                   push_items.append({
-                      "title":    ev.get("title",""),
-                      "currency": ev.get("country",""),
-                      "impact":   ev.get("impact",""),
-                      "date":     d, "time": t,
+                      "title": ev.get("title",""), "currency": ev.get("country",""),
+                      "impact": ev.get("impact",""), "date": d, "time": t,
                       "forecast": ev.get("forecast","") or "",
                       "previous": ev.get("previous","") or "",
-                      "actual":   ev.get("actual","") or "",
+                      "actual": ev.get("actual","") or "",
                   })
 
-          print(f"총 push: {len(push_items)}건")
-          actual_cnt = sum(1 for p in push_items if p["actual"])
-          print(f"actual 있는 항목: {actual_cnt}건")
+          print(f"총 push: {len(push_items)}건 (actual: {sum(1 for p in push_items if p['actual'])}건)")
 
           if push_items:
               res = requests.post("https://jpstocklive.com/api/push/ff_events",
