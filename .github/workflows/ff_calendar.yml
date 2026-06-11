@@ -9,29 +9,34 @@ jobs:
   push-events:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch Finnhub & Push to VPS
+      - name: Fetch Finnhub Economic Calendar & Push to VPS
         run: |
           python3 << 'PYEOF'
           import requests, json
-          from datetime import datetime, timezone, timedelta, date
+          from datetime import date, timedelta
 
-          JST = timezone(timedelta(hours=9))
           TOKEN = "d8lcsp9r01qtamgu4cg0d8lcsp9r01qtamgu4cgg"
 
-          # 오늘~7일 후
+          # 오늘~14일 후
           today = date.today().isoformat()
-          week  = (date.today() + timedelta(days=7)).isoformat()
+          end   = (date.today() + timedelta(days=14)).isoformat()
 
-          url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={week}&token={TOKEN}"
+          url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={end}&token={TOKEN}"
           r = requests.get(url, timeout=15)
-          print(f"Finnhub status: {r.status_code}")
-          print(f"응답: {r.text[:200]}")
+          print(f"status: {r.status_code}")
+          print(f"응답: {r.text[:300]}")
 
           if r.status_code != 200:
+              # 플랜 확인용 - 다른 무료 엔드포인트 테스트
+              r2 = requests.get(f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={TOKEN}", timeout=10)
+              print(f"stock/symbol status: {r2.status_code} (무료 플랜 확인용)")
               exit(1)
 
           events = r.json().get("economicCalendar", [])
           print(f"총: {len(events)}건")
-          for ev in events[:5]:
-              print(f"  {ev.get('time','?')[:16]} {ev.get('country','?')} {ev.get('event','?')[:30]} | actual={ev.get('actual','')} forecast={ev.get('estimate','')}")
+
+          # JPY/USD 필터
+          for ev in events[:10]:
+              if ev.get("country") in ("JP","US"):
+                  print(f"  {ev.get('time','')[:16]} {ev.get('country')} {ev.get('event','')[:30]} | actual={ev.get('actual','')} estimate={ev.get('estimate','')}")
           PYEOF
