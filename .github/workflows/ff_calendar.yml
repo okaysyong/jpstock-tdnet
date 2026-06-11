@@ -13,6 +13,9 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import requests, json
+          from datetime import datetime, timezone, timedelta
+
+          JST = timezone(timedelta(hours=9))
 
           headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
           items = []
@@ -35,18 +38,7 @@ jobs:
               print("데이터 없음")
               exit(0)
 
-          # country 필드 기반 필터 (currency 아님)
-          countries = {}
-          for ev in items:
-              c = ev.get("country","(없음)")
-              countries[c] = countries.get(c, 0) + 1
-          print(f"country 분포: {dict(sorted(countries.items()))}")
-
-          # USD/JPY country 코드 확인용 샘플
-          for ev in items[:5]:
-              print(f"  샘플: {json.dumps(ev, ensure_ascii=False)}")
-
-          # USD + JPY + High/Medium 필터
+          # USD/JPY + High/Medium 필터
           TARGET_COUNTRIES = {"USD", "JPY"}
           TARGET_IMPACTS   = {"High", "Medium"}
           filtered = [
@@ -57,21 +49,37 @@ jobs:
           print(f"필터 후: {len(filtered)}건 (USD/JPY, High/Medium)")
 
           if not filtered:
-              print("push 없음 — 종료")
+              print("push 없음")
               exit(0)
 
-          push_items = [{
-              "title":    ev.get("title",""),
-              "currency": ev.get("country",""),   # country → currency 매핑
-              "impact":   ev.get("impact",""),
-              "date":     ev.get("date","")[:10],  # ISO 날짜만
-              "time":     ev.get("date","")[11:16] if len(ev.get("date","")) > 10 else "",
-              "forecast": ev.get("forecast","") or "",
-              "previous": ev.get("previous","") or "",
-              "actual":   ev.get("actual","")   or "",
-          } for ev in filtered]
+          def parse_jst(date_str):
+              """ForexFactory ISO 날짜 → JST 날짜/시간 변환"""
+              try:
+                  # "2026-06-11T08:30:00-04:00" 형식
+                  dt = datetime.fromisoformat(date_str)
+                  dt_jst = dt.astimezone(JST)
+                  return dt_jst.strftime("%Y-%m-%d"), dt_jst.strftime("%H:%M")
+              except Exception:
+                  raw = date_str[:10]
+                  return raw, date_str[11:16] if len(date_str) > 10 else "00:00"
 
-          print(f"push_items 샘플: {push_items[0] if push_items else 'none'}")
+          push_items = []
+          for ev in filtered:
+              date_jst, time_jst = parse_jst(ev.get("date",""))
+              push_items.append({
+                  "title":    ev.get("title",""),
+                  "currency": ev.get("country",""),
+                  "impact":   ev.get("impact",""),
+                  "date":     date_jst,
+                  "time":     time_jst,
+                  "forecast": ev.get("forecast","") or "",
+                  "previous": ev.get("previous","") or "",
+                  "actual":   ev.get("actual","")   or "",
+              })
+
+          # 샘플 출력
+          for item in push_items[:3]:
+              print(f"  {item['date']} {item['time']} JST | {item['currency']} | {item['title']} | forecast={item['forecast']} actual={item['actual']}")
 
           VPS = "https://jpstocklive.com/api/push/ff_events"
           try:
