@@ -1,0 +1,70 @@
+name: ForexFactory Calendar Push
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # 15분마다
+  workflow_dispatch:           # 수동 실행 가능
+
+jobs:
+  push-events:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch ForexFactory & Push to VPS
+        run: |
+          python3 << 'PYEOF'
+          import requests, json
+
+          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+          items = []
+          for url in [
+              "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+              "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+          ]:
+              try:
+                  r = requests.get(url, headers=headers, timeout=15)
+                  if r.status_code == 200:
+                      data = r.json()
+                      items.extend(data)
+                      print(f"✅ {url.split('/')[-1]}: {len(data)}건")
+                  else:
+                      print(f"❌ {url.split('/')[-1]}: {r.status_code}")
+              except Exception as e:
+                  print(f"❌ error: {e}")
+
+          if not items:
+              print("데이터 없음 — 종료")
+              exit(0)
+
+          # JPY/USD, Medium(★★★) 이상만
+          IMPACT = {"High": 5, "Medium": 3, "Low": 1}
+          filtered = []
+          for ev in items:
+              currency = ev.get("currency", "")
+              impact   = ev.get("impact", "")
+              if currency not in ("JPY", "USD"):
+                  continue
+              if IMPACT.get(impact, 0) < 3:
+                  continue
+              filtered.append({
+                  "title":    ev.get("title", ""),
+                  "currency": currency,
+                  "impact":   impact,
+                  "date":     ev.get("date", ""),
+                  "time":     ev.get("time", ""),
+                  "forecast": ev.get("forecast", "") or "",
+                  "previous": ev.get("previous", "") or "",
+                  "actual":   ev.get("actual",   "") or "",
+              })
+
+          print(f"필터 후: {len(filtered)}건 (JPY/USD, Medium+)")
+          if filtered:
+              print("샘플:", filtered[0])
+
+          # VPS push
+          VPS = "https://jpstocklive.com/api/push/ff_events"
+          try:
+              res = requests.post(VPS, json={"items": filtered}, timeout=15)
+              print(f"VPS push: {res.status_code} | {res.text[:120]}")
+          except Exception as e:
+              print(f"VPS push 실패: {e}")
+          PYEOF
