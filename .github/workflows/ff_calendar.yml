@@ -58,13 +58,15 @@ jobs:
                                           flag = cls.replace("flag1-", "")
                                           break
 
-                              # JP/US만 허용
+                              # JP/US → 포함, EU ★5 → 포함, 나머지 제외
                               if flag == "jp":
                                   currency = "JPY"
                               elif flag == "us":
                                   currency = "USD"
+                              elif flag in ("eu","de","fr") and stars >= 5:
+                                  currency = "EUR"  # ECB 금리 등 ★5만
                               else:
-                                  continue  # 영국/독일/프랑스/중국 등 제외
+                                  continue  # 영국/중국 등 제외
 
                               nk_events.append({
                                   "date": current_date, "time": texts[0],
