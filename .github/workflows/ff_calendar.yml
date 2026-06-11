@@ -24,48 +24,10 @@ jobs:
               "Accept-Language": "ja,en-US;q=0.9",
           }
 
-          JPY_KW = [
-              "国内企業物価","日銀","BOJ","景況判断BSI","短観",
-              "対外証券投資","対内証券投資","機械受注","月次GDP",
-              "鉱工業生産指数","設備稼働率","完全失業率","有効求人",
-              "家計調査","RICS住宅価格","国内","景気動向",
-          ]
-          USD_KW = [
-              "MBA住宅ローン","原油在庫","ガソリン在庫","留出油在庫",
-              "FRB","FOMC","連邦","ADP雇用","非農業部門","ミシガン大学",
-              "EIA","Baker Hughes","米.*CPI","米.*PPI","米.*GDP",
-          ]
-          ENG_USD = [
-              "Bill Auction","Bond Auction","PMI","ISM","NFP",
-              "Retail Sales","Housing","Unemployment","Jobless","Fed",
-              "Capacity Utilization","Industrial Production",
-              "Consumer Confidence","Producer Price","Consumer Price",
-              "Nonfarm","Initial Claims","Continuing Claims",
-              "UoM","Michigan","Prelim","Flash",
-          ]
-
-          def guess_currency(title, time_str):
-              for kw in JPY_KW:
-                  if re.search(kw, title): return "JPY"
-              for kw in USD_KW:
-                  if re.search(kw, title): return "USD"
-              for kw in ENG_USD:
-                  if kw in title: return "USD"
-              if re.match(r'^[A-Za-z0-9\s\-\./\(\)]+$', title.strip()):
-                  return "USD"
-              try:
-                  h = int(time_str.split(":")[0])
-                  if 8 <= h <= 14: return "JPY"
-                  if 20 <= h <= 23: return "USD"
-              except: pass
-              if re.search(r'[\u3040-\u9fff]', title): return "JPY"
-              return "USD"
-
-          # nikkei225jp 스크래핑
-          nk_events = []
+          # ── 1. nikkei225jp → actual 맵 (제목+시간 기준) ──
+          actual_map = {}  # (time, title_normalized) → actual
           try:
               r = requests.get("https://nikkei225jp.com/schedule/", headers=headers, timeout=15)
-              print(f"nikkei225jp: {r.status_code}")
               if r.status_code == 200:
                   soup = BeautifulSoup(r.text, "html.parser")
                   main_table = next((t for t in soup.find_all("table") if len(t.find_all("tr")) > 10), None)
@@ -81,25 +43,16 @@ jobs:
                                   current_date = f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
                               continue
                           if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]) and current_date:
-                              stars = texts[1].count("★")
-                              if stars < 2: continue
-                              nk_events.append({
-                                  "date": current_date, "time": texts[0],
-                                  "title": texts[2], "actual": texts[3],
-                                  "forecast": texts[4], "previous": texts[5],
-                                  "currency": guess_currency(texts[2], texts[0]),
-                                  "stars": stars,
-                              })
-                  usd = sum(1 for e in nk_events if e["currency"]=="USD")
-                  jpy = sum(1 for e in nk_events if e["currency"]=="JPY")
-                  print(f"파싱: {len(nk_events)}건 (USD:{usd} JPY:{jpy})")
-                  for ev in nk_events[:4]:
-                      print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:28]} | actual={ev['actual']}")
+                              time_str = texts[0]
+                              title    = texts[2]
+                              actual   = texts[3]
+                              if actual:
+                                  actual_map[(current_date, time_str, title)] = actual
+                  print(f"nikkei225jp actual 맵: {len(actual_map)}건")
           except Exception as e:
-              print(f"error: {e}")
-              import traceback; traceback.print_exc()
+              print(f"nikkei225jp error: {e}")
 
-          # ForexFactory JSON
+          # ── 2. ForexFactory JSON (USD/JPY 기준, country 명확) ──
           ff_items = []
           for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
                       "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
@@ -107,8 +60,17 @@ jobs:
                   res = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
                   if res.status_code == 200:
                       ff_items.extend(res.json())
-              except: pass
-          print(f"FF: {len(ff_items)}건")
+                      print(f"FF {url.split('/')[-1]}: {len(res.json())}건")
+              except Exception as e:
+                  print(f"FF error: {e}")
+
+          # ── 3. USD/JPY High/Medium 필터 ──
+          TARGET = {"USD", "JPY"}
+          IMPACT = {"High", "Medium"}
+          filtered = [ev for ev in ff_items
+                      if ev.get("country","") in TARGET
+                      and ev.get("impact","") in IMPACT]
+          print(f"FF 필터: {len(filtered)}건 (USD/JPY, High/Medium)")
 
           def parse_jst(s):
               try:
@@ -117,31 +79,59 @@ jobs:
               except:
                   return s[:10], "00:00"
 
+          # ── 4. FF 기준으로 push, nikkei225jp에서 actual 보완 ──
+          # FF 제목 → nikkei225jp 제목 매핑 (주요 지표)
+          TITLE_MAP = {
+              "Core CPI m/m":           "消費者物価指数（CPIコア指数）[前月比]",
+              "Core CPI y/y":           "消費者物価指数（CPIコア指数）[前年比]",
+              "CPI m/m":                "消費者物価指数（CPI）[前月比]",
+              "CPI y/y":                "消費者物価指数（CPI）[前年比]",
+              "Core PPI m/m":           "生産者物価指数（PPIコア指数）[前月比]",
+              "PPI m/m":                "生産者物価指数（PPI）[前月比]",
+              "Core PPI y/y":           "生産者物価指数（PPIコア指数）[前年比]",
+              "PPI y/y":                "生産者物価指数（PPI）[前年比]",
+              "Unemployment Claims":    "新規失業保険申請件数",
+              "Prelim UoM Consumer Sentiment": "ミシガン大学消費者信頼感指数",
+          }
+
           push_items = []
-          for ev in nk_events:
+          for ev in filtered:
+              d, t = parse_jst(ev.get("date",""))
+              ff_title = ev.get("title","")
+
+              # nikkei225jp에서 actual 찾기
+              actual = ev.get("actual","") or ""
+              if not actual:
+                  # 직접 제목 매칭
+                  nk_title = TITLE_MAP.get(ff_title, "")
+                  if nk_title:
+                      # 월 prefix 무시하고 검색
+                      for (nd, nt, ntitle), nact in actual_map.items():
+                          if nd == d and nt == t and nk_title in ntitle:
+                              actual = nact
+                              break
+                  # 매핑 없으면 부분 매칭
+                  if not actual:
+                      for (nd, nt, ntitle), nact in actual_map.items():
+                          if nd == d and nt == t and ff_title[:8].lower() in ntitle.lower():
+                              actual = nact
+                              break
+
               push_items.append({
-                  "title": ev["title"], "currency": ev["currency"],
-                  "impact": "High" if ev["stars"] >= 4 else "Medium",
-                  "date": ev["date"], "time": ev["time"],
-                  "forecast": ev["forecast"], "previous": ev["previous"],
-                  "actual": ev["actual"],
+                  "title":    ff_title,
+                  "currency": ev.get("country",""),
+                  "impact":   ev.get("impact",""),
+                  "date":     d, "time": t,
+                  "forecast": ev.get("forecast","") or "",
+                  "previous": ev.get("previous","") or "",
+                  "actual":   actual,
               })
 
-          nk_keys = {(ev["date"], ev["time"][:5]) for ev in nk_events}
-          for ev in ff_items:
-              if ev.get("country") not in ("USD","JPY"): continue
-              if ev.get("impact") not in ("High","Medium"): continue
-              d, t = parse_jst(ev.get("date",""))
-              if (d, t) not in nk_keys:
-                  push_items.append({
-                      "title": ev.get("title",""), "currency": ev.get("country",""),
-                      "impact": ev.get("impact",""), "date": d, "time": t,
-                      "forecast": ev.get("forecast","") or "",
-                      "previous": ev.get("previous","") or "",
-                      "actual": ev.get("actual","") or "",
-                  })
+          actual_cnt = sum(1 for p in push_items if p["actual"])
+          print(f"총 push: {len(push_items)}건 (actual: {actual_cnt}건)")
+          for p in push_items[:4]:
+              print(f"  {p['date']} {p['time']} {p['currency']} {p['title'][:28]} | actual={p['actual']}")
 
-          print(f"총 push: {len(push_items)}건 (actual: {sum(1 for p in push_items if p['actual'])}건)")
           if push_items:
               res = requests.post("https://jpstocklive.com/api/push/ff_events",
                                   json={"items": push_items}, timeout=30)
