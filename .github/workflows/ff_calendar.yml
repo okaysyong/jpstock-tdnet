@@ -2,8 +2,8 @@ name: ForexFactory Calendar Push
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # 15분마다
-  workflow_dispatch:           # 수동 실행 가능
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 jobs:
   push-events:
@@ -25,45 +25,46 @@ jobs:
                   if r.status_code == 200:
                       data = r.json()
                       items.extend(data)
-                      print(f"✅ {url.split('/')[-1]}: {len(data)}건")
+                      print(f"OK {url.split('/')[-1]}: {len(data)}건")
                   else:
-                      print(f"❌ {url.split('/')[-1]}: {r.status_code}")
+                      print(f"NG {url.split('/')[-1]}: {r.status_code}")
               except Exception as e:
-                  print(f"❌ error: {e}")
+                  print(f"NG error: {e}")
 
           if not items:
-              print("데이터 없음 — 종료")
+              print("데이터 없음")
               exit(0)
 
-          # JPY/USD, Medium(★★★) 이상만
-          IMPACT = {"High": 5, "Medium": 3, "Low": 1}
-          filtered = []
+          # 디버그: 필드 분포
+          impacts = {}
+          currencies = {}
           for ev in items:
-              currency = ev.get("currency", "")
-              impact   = ev.get("impact", "")
-              if currency not in ("JPY", "USD"):
-                  continue
-              if IMPACT.get(impact, 0) < 3:
-                  continue
-              filtered.append({
-                  "title":    ev.get("title", ""),
-                  "currency": currency,
-                  "impact":   impact,
-                  "date":     ev.get("date", ""),
-                  "time":     ev.get("time", ""),
-                  "forecast": ev.get("forecast", "") or "",
-                  "previous": ev.get("previous", "") or "",
-                  "actual":   ev.get("actual",   "") or "",
-              })
+              imp = ev.get("impact","(없음)")
+              cur = ev.get("currency","(없음)")
+              impacts[imp]    = impacts.get(imp, 0) + 1
+              currencies[cur] = currencies.get(cur, 0) + 1
+          print(f"impact 분포: {dict(sorted(impacts.items()))}")
+          print(f"currency 분포: {dict(sorted(currencies.items()))}")
+          print(f"샘플 1건: {json.dumps(items[0], ensure_ascii=False)}")
 
-          print(f"필터 후: {len(filtered)}건 (JPY/USD, Medium+)")
-          if filtered:
-              print("샘플:", filtered[0])
+          # JPY/USD 전체 (impact 필터 없이 일단 push)
+          filtered = [ev for ev in items if ev.get("currency","") in ("JPY","USD")]
+          print(f"JPY/USD 전체: {len(filtered)}건")
 
-          # VPS push
+          push_items = [{
+              "title":    ev.get("title",""),
+              "currency": ev.get("currency",""),
+              "impact":   ev.get("impact",""),
+              "date":     ev.get("date",""),
+              "time":     ev.get("time",""),
+              "forecast": ev.get("forecast","") or "",
+              "previous": ev.get("previous","") or "",
+              "actual":   ev.get("actual","")   or "",
+          } for ev in filtered]
+
           VPS = "https://jpstocklive.com/api/push/ff_events"
           try:
-              res = requests.post(VPS, json={"items": filtered}, timeout=15)
+              res = requests.post(VPS, json={"items": push_items}, timeout=15)
               print(f"VPS push: {res.status_code} | {res.text[:120]}")
           except Exception as e:
               print(f"VPS push 실패: {e}")
