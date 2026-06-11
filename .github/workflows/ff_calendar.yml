@@ -34,31 +34,30 @@ jobs:
               except Exception as e:
                   print(f"FF error: {e}")
 
-          # ── 2. investing.com 경제 캘린더 (actual 값) ──
-          actual_map = {}  # "YYYY-MM-DD|이벤트명" → actual 값
+          # ── 2. MyFXBook actual 값 시도 ──
+          actual_map = {}
           try:
+              mfx_url = "https://www.myfxbook.com/forex-economic-calendar-data"
               today = date.today().isoformat()
-              inv_url = f"https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
-              inv_headers = {
-                  **headers,
-                  "X-Requested-With": "XMLHttpRequest",
-                  "Referer": "https://www.investing.com/economic-calendar/",
-              }
-              inv_data = {
-                  "country[]": ["35", "72"],  # 35=JP, 72=US
-                  "importance[]": ["2", "3"],  # Medium, High
-                  "timeZone": "18",  # JST
-                  "timeFilter": "timeRemain",
-                  "currentTab": "today",
-                  "submitFilters": "1",
-                  "limit_from": "0",
-              }
-              inv_r = requests.post(inv_url, headers=inv_headers, data=inv_data, timeout=15)
-              print(f"Investing.com status: {inv_r.status_code}")
-              if inv_r.status_code == 200:
-                  print(f"Investing.com 응답: {inv_r.text[:300]}")
+              mfx_r = requests.get(
+                  mfx_url,
+                  params={"startDate": today, "endDate": today},
+                  headers=headers, timeout=15
+              )
+              print(f"MyFXBook status: {mfx_r.status_code}")
+              if mfx_r.status_code == 200:
+                  print(f"MyFXBook 응답: {mfx_r.text[:300]}")
+                  try:
+                      mfx_data = mfx_r.json()
+                      for ev in mfx_data.get("calendar", mfx_data if isinstance(mfx_data, list) else []):
+                          if ev.get("actual"):
+                              key = ev.get("name","") or ev.get("title","")
+                              actual_map[key] = ev.get("actual","")
+                      print(f"actual 있는 항목: {len(actual_map)}건")
+                  except Exception as e:
+                      print(f"MyFXBook 파싱 오류: {e}")
           except Exception as e:
-              print(f"Investing.com error: {e}")
+              print(f"MyFXBook error: {e}")
 
           # ── 3. ForexFactory 필터 + push ──
           TARGET_COUNTRIES = {"USD", "JPY"}
@@ -81,19 +80,22 @@ jobs:
           push_items = []
           for ev in filtered:
               date_jst, time_jst = parse_jst(ev.get("date",""))
+              title = ev.get("title","")
+              # actual 값 매핑 시도
+              actual = ev.get("actual","") or actual_map.get(title, "")
               push_items.append({
-                  "title":    ev.get("title",""),
+                  "title":    title,
                   "currency": ev.get("country",""),
                   "impact":   ev.get("impact",""),
                   "date":     date_jst,
                   "time":     time_jst,
                   "forecast": ev.get("forecast","") or "",
                   "previous": ev.get("previous","") or "",
-                  "actual":   ev.get("actual","")   or "",
+                  "actual":   actual,
               })
 
           if push_items:
               VPS = "https://jpstocklive.com/api/push/ff_events"
-              res = requests.post(VPS, json={"items": push_items}, timeout=15)
+              res = requests.post(VPS, json={"items": push_items}, timeout=30)
               print(f"VPS push: {res.status_code} | {res.text[:100]}")
           PYEOF
