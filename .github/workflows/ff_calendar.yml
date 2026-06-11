@@ -9,85 +9,29 @@ jobs:
   push-events:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch ForexFactory & Push to VPS
+      - name: Fetch Finnhub & Push to VPS
         run: |
           python3 << 'PYEOF'
           import requests, json
-          from datetime import datetime, timezone, timedelta
+          from datetime import datetime, timezone, timedelta, date
 
           JST = timezone(timedelta(hours=9))
+          TOKEN = "d8lcsp9r01qtamgu4cg0d8lcsp9r01qtamgu4cgg"
 
-          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-          items = []
-          for url in [
-              "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-              "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-          ]:
-              try:
-                  r = requests.get(url, headers=headers, timeout=15)
-                  if r.status_code == 200:
-                      data = r.json()
-                      items.extend(data)
-                      print(f"OK {url.split('/')[-1]}: {len(data)}건")
-                  else:
-                      print(f"NG {url.split('/')[-1]}: {r.status_code}")
-              except Exception as e:
-                  print(f"NG error: {e}")
+          # 오늘~7일 후
+          today = date.today().isoformat()
+          week  = (date.today() + timedelta(days=7)).isoformat()
 
-          if not items:
-              print("데이터 없음")
-              exit(0)
+          url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={week}&token={TOKEN}"
+          r = requests.get(url, timeout=15)
+          print(f"Finnhub status: {r.status_code}")
+          print(f"응답: {r.text[:200]}")
 
-          # actual 확인
-          actual_count = sum(1 for ev in items if ev.get("actual"))
-          print(f"actual 있는 항목: {actual_count}건")
-          for ev in items:
-              if ev.get("actual"):
-                  print(f"  {ev.get('date','')[:16]} {ev.get('country')} {ev.get('title','')[:30]} = {ev.get('actual')}")
+          if r.status_code != 200:
+              exit(1)
 
-          # USD/JPY + High/Medium 필터
-          TARGET_COUNTRIES = {"USD", "JPY"}
-          TARGET_IMPACTS   = {"High", "Medium"}
-          filtered = [
-              ev for ev in items
-              if ev.get("country","") in TARGET_COUNTRIES
-              and ev.get("impact","") in TARGET_IMPACTS
-          ]
-          print(f"필터 후: {len(filtered)}건 (USD/JPY, High/Medium)")
-
-          if not filtered:
-              print("push 없음")
-              exit(0)
-
-          def parse_jst(date_str):
-              try:
-                  dt = datetime.fromisoformat(date_str)
-                  dt_jst = dt.astimezone(JST)
-                  return dt_jst.strftime("%Y-%m-%d"), dt_jst.strftime("%H:%M")
-              except Exception:
-                  return date_str[:10], date_str[11:16] if len(date_str) > 10 else "00:00"
-
-          push_items = []
-          for ev in filtered:
-              date_jst, time_jst = parse_jst(ev.get("date",""))
-              push_items.append({
-                  "title":    ev.get("title",""),
-                  "currency": ev.get("country",""),
-                  "impact":   ev.get("impact",""),
-                  "date":     date_jst,
-                  "time":     time_jst,
-                  "forecast": ev.get("forecast","") or "",
-                  "previous": ev.get("previous","") or "",
-                  "actual":   ev.get("actual","")   or "",
-              })
-
-          for item in push_items[:3]:
-              print(f"  {item['date']} {item['time']} JST | {item['currency']} | {item['title']} | forecast={item['forecast']} actual={item['actual']}")
-
-          VPS = "https://jpstocklive.com/api/push/ff_events"
-          try:
-              res = requests.post(VPS, json={"items": push_items}, timeout=15)
-              print(f"VPS push: {res.status_code} | {res.text[:120]}")
-          except Exception as e:
-              print(f"VPS push 실패: {e}")
+          events = r.json().get("economicCalendar", [])
+          print(f"총: {len(events)}건")
+          for ev in events[:5]:
+              print(f"  {ev.get('time','?')[:16]} {ev.get('country','?')} {ev.get('event','?')[:30]} | actual={ev.get('actual','')} forecast={ev.get('estimate','')}")
           PYEOF
