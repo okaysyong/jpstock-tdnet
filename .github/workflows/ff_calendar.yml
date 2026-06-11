@@ -35,32 +35,43 @@ jobs:
               print("데이터 없음")
               exit(0)
 
-          # 디버그: 필드 분포
-          impacts = {}
-          currencies = {}
+          # country 필드 기반 필터 (currency 아님)
+          countries = {}
           for ev in items:
-              imp = ev.get("impact","(없음)")
-              cur = ev.get("currency","(없음)")
-              impacts[imp]    = impacts.get(imp, 0) + 1
-              currencies[cur] = currencies.get(cur, 0) + 1
-          print(f"impact 분포: {dict(sorted(impacts.items()))}")
-          print(f"currency 분포: {dict(sorted(currencies.items()))}")
-          print(f"샘플 1건: {json.dumps(items[0], ensure_ascii=False)}")
+              c = ev.get("country","(없음)")
+              countries[c] = countries.get(c, 0) + 1
+          print(f"country 분포: {dict(sorted(countries.items()))}")
 
-          # JPY/USD 전체 (impact 필터 없이 일단 push)
-          filtered = [ev for ev in items if ev.get("currency","") in ("JPY","USD")]
-          print(f"JPY/USD 전체: {len(filtered)}건")
+          # USD/JPY country 코드 확인용 샘플
+          for ev in items[:5]:
+              print(f"  샘플: {json.dumps(ev, ensure_ascii=False)}")
+
+          # USD + JPY + High/Medium 필터
+          TARGET_COUNTRIES = {"USD", "JPY"}
+          TARGET_IMPACTS   = {"High", "Medium"}
+          filtered = [
+              ev for ev in items
+              if ev.get("country","") in TARGET_COUNTRIES
+              and ev.get("impact","") in TARGET_IMPACTS
+          ]
+          print(f"필터 후: {len(filtered)}건 (USD/JPY, High/Medium)")
+
+          if not filtered:
+              print("push 없음 — 종료")
+              exit(0)
 
           push_items = [{
               "title":    ev.get("title",""),
-              "currency": ev.get("currency",""),
+              "currency": ev.get("country",""),   # country → currency 매핑
               "impact":   ev.get("impact",""),
-              "date":     ev.get("date",""),
-              "time":     ev.get("time",""),
+              "date":     ev.get("date","")[:10],  # ISO 날짜만
+              "time":     ev.get("date","")[11:16] if len(ev.get("date","")) > 10 else "",
               "forecast": ev.get("forecast","") or "",
               "previous": ev.get("previous","") or "",
               "actual":   ev.get("actual","")   or "",
           } for ev in filtered]
+
+          print(f"push_items 샘플: {push_items[0] if push_items else 'none'}")
 
           VPS = "https://jpstocklive.com/api/push/ff_events"
           try:
