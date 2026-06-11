@@ -9,34 +9,91 @@ jobs:
   push-events:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch Finnhub Economic Calendar & Push to VPS
+      - name: Fetch Events & Push to VPS
         run: |
           python3 << 'PYEOF'
-          import requests, json
-          from datetime import date, timedelta
+          import requests, json, re
+          from datetime import datetime, timezone, timedelta, date
 
-          TOKEN = "d8lcsp9r01qtamgu4cg0d8lcsp9r01qtamgu4cgg"
+          JST = timezone(timedelta(hours=9))
+          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-          # 오늘~14일 후
-          today = date.today().isoformat()
-          end   = (date.today() + timedelta(days=14)).isoformat()
+          # ── 1. ForexFactory (forecast/previous/시간) ──
+          ff_items = []
+          for url in [
+              "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+              "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+          ]:
+              try:
+                  r = requests.get(url, headers=headers, timeout=15)
+                  if r.status_code == 200:
+                      ff_items.extend(r.json())
+                      print(f"FF OK {url.split('/')[-1]}: {len(r.json())}건")
+                  else:
+                      print(f"FF NG {url.split('/')[-1]}: {r.status_code}")
+              except Exception as e:
+                  print(f"FF error: {e}")
 
-          url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={end}&token={TOKEN}"
-          r = requests.get(url, timeout=15)
-          print(f"status: {r.status_code}")
-          print(f"응답: {r.text[:300]}")
+          # ── 2. investing.com 경제 캘린더 (actual 값) ──
+          actual_map = {}  # "YYYY-MM-DD|이벤트명" → actual 값
+          try:
+              today = date.today().isoformat()
+              inv_url = f"https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+              inv_headers = {
+                  **headers,
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Referer": "https://www.investing.com/economic-calendar/",
+              }
+              inv_data = {
+                  "country[]": ["35", "72"],  # 35=JP, 72=US
+                  "importance[]": ["2", "3"],  # Medium, High
+                  "timeZone": "18",  # JST
+                  "timeFilter": "timeRemain",
+                  "currentTab": "today",
+                  "submitFilters": "1",
+                  "limit_from": "0",
+              }
+              inv_r = requests.post(inv_url, headers=inv_headers, data=inv_data, timeout=15)
+              print(f"Investing.com status: {inv_r.status_code}")
+              if inv_r.status_code == 200:
+                  print(f"Investing.com 응답: {inv_r.text[:300]}")
+          except Exception as e:
+              print(f"Investing.com error: {e}")
 
-          if r.status_code != 200:
-              # 플랜 확인용 - 다른 무료 엔드포인트 테스트
-              r2 = requests.get(f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={TOKEN}", timeout=10)
-              print(f"stock/symbol status: {r2.status_code} (무료 플랜 확인용)")
-              exit(1)
+          # ── 3. ForexFactory 필터 + push ──
+          TARGET_COUNTRIES = {"USD", "JPY"}
+          TARGET_IMPACTS   = {"High", "Medium"}
+          filtered = [
+              ev for ev in ff_items
+              if ev.get("country","") in TARGET_COUNTRIES
+              and ev.get("impact","") in TARGET_IMPACTS
+          ]
+          print(f"FF 필터 후: {len(filtered)}건")
 
-          events = r.json().get("economicCalendar", [])
-          print(f"총: {len(events)}건")
+          def parse_jst(date_str):
+              try:
+                  dt = datetime.fromisoformat(date_str)
+                  dt_jst = dt.astimezone(JST)
+                  return dt_jst.strftime("%Y-%m-%d"), dt_jst.strftime("%H:%M")
+              except Exception:
+                  return date_str[:10], date_str[11:16] if len(date_str) > 10 else "00:00"
 
-          # JPY/USD 필터
-          for ev in events[:10]:
-              if ev.get("country") in ("JP","US"):
-                  print(f"  {ev.get('time','')[:16]} {ev.get('country')} {ev.get('event','')[:30]} | actual={ev.get('actual','')} estimate={ev.get('estimate','')}")
+          push_items = []
+          for ev in filtered:
+              date_jst, time_jst = parse_jst(ev.get("date",""))
+              push_items.append({
+                  "title":    ev.get("title",""),
+                  "currency": ev.get("country",""),
+                  "impact":   ev.get("impact",""),
+                  "date":     date_jst,
+                  "time":     time_jst,
+                  "forecast": ev.get("forecast","") or "",
+                  "previous": ev.get("previous","") or "",
+                  "actual":   ev.get("actual","")   or "",
+              })
+
+          if push_items:
+              VPS = "https://jpstocklive.com/api/push/ff_events"
+              res = requests.post(VPS, json={"items": push_items}, timeout=15)
+              print(f"VPS push: {res.status_code} | {res.text[:100]}")
           PYEOF
