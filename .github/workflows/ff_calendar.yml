@@ -58,15 +58,18 @@ jobs:
                                           flag = cls.replace("flag1-", "")
                                           break
 
-                              # JP/US → 포함, EU ★5 → 포함, 나머지 제외
+                              # 포함 기준:
+                              # JP/US → ★2 이상 전부
+                              # EU(ECB) → ★5만 (ECB금리 등)
+                              # 나머지(GB/DE/AU/CN 등) → 제외
                               if flag == "jp":
                                   currency = "JPY"
                               elif flag == "us":
                                   currency = "USD"
-                              elif flag in ("eu","de","fr") and stars >= 5:
-                                  currency = "EUR"  # ECB 금리 등 ★5만
+                              elif flag in ("eu",) and stars >= 5:
+                                  currency = "EUR"
                               else:
-                                  continue  # 영국/중국 등 제외
+                                  continue
 
                               nk_events.append({
                                   "date": current_date, "time": texts[0],
@@ -77,7 +80,8 @@ jobs:
 
                   usd = sum(1 for e in nk_events if e["currency"]=="USD")
                   jpy = sum(1 for e in nk_events if e["currency"]=="JPY")
-                  print(f"파싱: {len(nk_events)}건 (USD:{usd} JPY:{jpy})")
+                  eur = sum(1 for e in nk_events if e["currency"]=="EUR")
+                  print(f"파싱: {len(nk_events)}건 (JPY:{jpy} USD:{usd} EUR:{eur})")
                   for ev in nk_events[:6]:
                       print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:28]} | actual={ev['actual']}")
 
@@ -131,6 +135,8 @@ jobs:
 
           actual_cnt = sum(1 for p in push_items if p["actual"])
           print(f"총 push: {len(push_items)}건 (actual: {actual_cnt}건)")
+          for p in push_items[:4]:
+              print(f"  {p['date']} {p['time']} {p['currency']} {p['title'][:28]} | actual={p['actual']}")
 
           if push_items:
               res = requests.post("https://jpstocklive.com/api/push/ff_events",
