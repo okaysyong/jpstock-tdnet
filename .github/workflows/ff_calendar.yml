@@ -113,6 +113,7 @@ jobs:
               push_items.append({
                   "title": ev["title"], "currency": ev["currency"],
                   "impact": "High" if ev["stars"] >= 4 else "Medium",
+                  "stars": ev["stars"],  # nikkei225jp 실제 ★ 개수
                   "date": ev["date"], "time": ev["time"],
                   "forecast": ev["forecast"], "previous": ev["previous"],
                   "actual": ev["actual"],
