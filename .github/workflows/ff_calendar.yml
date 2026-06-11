@@ -14,120 +14,92 @@ jobs:
           pip install -q beautifulsoup4
           python3 << 'PYEOF'
           import requests, json, re
-          from datetime import datetime, timezone, timedelta, date
+          from datetime import datetime, timezone, timedelta
           from bs4 import BeautifulSoup
 
           JST = timezone(timedelta(hours=9))
           year = datetime.now(JST).year
-
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
               "Accept-Language": "ja,en-US;q=0.9",
           }
 
-          # 명확한 JPY 키워드 (일본 발표 지표)
           JPY_KW = [
-              "国内企業物価", "日銀", "BOJ", "景況判断BSI", "短観",
-              "対外証券投資", "対内証券投資", "機械受注", "月次GDP",
-              "鉱工業生産指数", "設備稼働率", "完全失業率", "有効求人",
-              "家計調査", "第.*四半期.*景況", "RICS住宅価格",
-              "国内", "前月比.*円", "前年比.*円",
+              "国内企業物価","日銀","BOJ","景況判断BSI","短観",
+              "対外証券投資","対内証券投資","機械受注","月次GDP",
+              "鉱工業生産指数","設備稼働率","完全失業率","有効求人",
+              "家計調査","RICS住宅価格","国内","景気動向",
           ]
-          # 명확한 USD 키워드
           USD_KW = [
-              "MBA住宅ローン", "原油在庫", "ガソリン在庫", "留出油在庫",
-              "米.*CPI", "米.*PPI", "米.*GDP", "米.*PMI", "米.*ISM",
-              "FRB", "FOMC", "連邦", "ADP雇用", "非農業部門",
-              "新規失業保険", "消費者信頼指数.*米", "ミシガン大学",
-              "MBA", "EIA", "Baker Hughes",
+              "MBA住宅ローン","原油在庫","ガソリン在庫","留出油在庫",
+              "FRB","FOMC","連邦","ADP雇用","非農業部門","ミシガン大学",
+              "EIA","Baker Hughes","米.*CPI","米.*PPI","米.*GDP",
           ]
-          # 영어 제목 패턴 → USD
           ENG_USD = [
-              "Bill Auction", "Bond Auction", "CPI", "PPI", "PMI", "ISM",
-              "NFP", "GDP", "PCE", "Core", "Retail", "Housing",
-              "Unemployment", "Jobless", "Fed", "FOMC", "Capacity",
-              "Industrial Production", "Consumer", "Producer",
+              "Bill Auction","Bond Auction","PMI","ISM","NFP",
+              "Retail Sales","Housing","Unemployment","Jobless","Fed",
+              "Capacity Utilization","Industrial Production",
+              "Consumer Confidence","Producer Price","Consumer Price",
+              "Nonfarm","Initial Claims","Continuing Claims",
+              "UoM","Michigan","Prelim","Flash",
           ]
 
           def guess_currency(title, time_str):
-              # 명확한 JPY
               for kw in JPY_KW:
-                  if re.search(kw, title):
-                      return "JPY"
-              # 명확한 USD
+                  if re.search(kw, title): return "JPY"
               for kw in USD_KW:
-                  if re.search(kw, title):
-                      return "USD"
-              # 영어 제목 → USD
+                  if re.search(kw, title): return "USD"
               for kw in ENG_USD:
-                  if kw in title:
-                      return "USD"
-              # 시간대로 판단
+                  if kw in title: return "USD"
+              if re.match(r'^[A-Za-z0-9\s\-\./\(\)]+$', title.strip()):
+                  return "USD"
               try:
                   h = int(time_str.split(":")[0])
-                  if 8 <= h <= 14:   # 일본 발표 시간대
-                      return "JPY"
-                  if 20 <= h <= 23:  # 미국 발표 시간대
-                      return "USD"
-              except:
-                  pass
-              # 일본어 제목이면 JPY
-              if re.search(r'[\u3040-\u9fff]', title):
-                  return "JPY"
+                  if 8 <= h <= 14: return "JPY"
+                  if 20 <= h <= 23: return "USD"
+              except: pass
+              if re.search(r'[\u3040-\u9fff]', title): return "JPY"
               return "USD"
 
-          # ── nikkei225jp.com 스크래핑 ──
+          # nikkei225jp 스크래핑
           nk_events = []
           try:
               r = requests.get("https://nikkei225jp.com/schedule/", headers=headers, timeout=15)
               print(f"nikkei225jp: {r.status_code}")
               if r.status_code == 200:
                   soup = BeautifulSoup(r.text, "html.parser")
-                  main_table = None
-                  for t in soup.find_all("table"):
-                      if len(t.find_all("tr")) > 10:
-                          main_table = t
-                          break
-
+                  main_table = next((t for t in soup.find_all("table") if len(t.find_all("tr")) > 10), None)
                   if main_table:
                       current_date = None
                       for row in main_table.find_all("tr"):
                           cells = row.find_all(["td","th"])
                           texts = [c.get_text(strip=True) for c in cells]
-                          if not texts:
-                              continue
+                          if not texts: continue
                           if len(texts) == 1 and re.match(r'\d+/\d+', texts[0]):
                               m = re.match(r'(\d+)/(\d+)', texts[0])
                               if m:
                                   current_date = f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
                               continue
-                          if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]):
-                              time_str = texts[0]
-                              stars    = texts[1].count("★")
-                              title    = texts[2]
-                              actual   = texts[3]
-                              forecast = texts[4]
-                              previous = texts[5]
-                              currency = guess_currency(title, time_str)
-                              if current_date and stars >= 2:
-                                  nk_events.append({
-                                      "date": current_date, "time": time_str,
-                                      "title": title, "actual": actual,
-                                      "forecast": forecast, "previous": previous,
-                                      "currency": currency, "stars": stars,
-                                  })
-
+                          if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]) and current_date:
+                              stars = texts[1].count("★")
+                              if stars < 2: continue
+                              nk_events.append({
+                                  "date": current_date, "time": texts[0],
+                                  "title": texts[2], "actual": texts[3],
+                                  "forecast": texts[4], "previous": texts[5],
+                                  "currency": guess_currency(texts[2], texts[0]),
+                                  "stars": stars,
+                              })
                   usd = sum(1 for e in nk_events if e["currency"]=="USD")
                   jpy = sum(1 for e in nk_events if e["currency"]=="JPY")
                   print(f"파싱: {len(nk_events)}건 (USD:{usd} JPY:{jpy})")
-                  for ev in nk_events[:6]:
+                  for ev in nk_events[:4]:
                       print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:28]} | actual={ev['actual']}")
-
           except Exception as e:
               print(f"error: {e}")
               import traceback; traceback.print_exc()
 
-          # ── ForexFactory JSON ──
+          # ForexFactory JSON
           ff_items = []
           for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
                       "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
