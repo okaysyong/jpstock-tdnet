@@ -11,91 +11,81 @@ jobs:
     steps:
       - name: Fetch Events & Push to VPS
         run: |
+          pip install -q beautifulsoup4
           python3 << 'PYEOF'
           import requests, json, re
           from datetime import datetime, timezone, timedelta, date
+          from bs4 import BeautifulSoup
 
           JST = timezone(timedelta(hours=9))
-          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml",
+              "Accept-Language": "en-US,en;q=0.9",
+          }
 
-          # ── 1. ForexFactory (forecast/previous/시간) ──
-          ff_items = []
-          for url in [
-              "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-              "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-          ]:
-              try:
-                  r = requests.get(url, headers=headers, timeout=15)
-                  if r.status_code == 200:
-                      ff_items.extend(r.json())
-                      print(f"FF OK {url.split('/')[-1]}: {len(r.json())}건")
-                  else:
-                      print(f"FF NG {url.split('/')[-1]}: {r.status_code}")
-              except Exception as e:
-                  print(f"FF error: {e}")
-
-          # ── 2. MyFXBook actual 값 시도 ──
+          # ForexFactory HTML 스크래핑 시도
           actual_map = {}
           try:
-              mfx_url = "https://www.myfxbook.com/forex-economic-calendar-data"
-              today = date.today().isoformat()
-              mfx_r = requests.get(
-                  mfx_url,
-                  params={"startDate": today, "endDate": today},
-                  headers=headers, timeout=15
-              )
-              print(f"MyFXBook status: {mfx_r.status_code}")
-              if mfx_r.status_code == 200:
-                  print(f"MyFXBook 응답: {mfx_r.text[:300]}")
-                  try:
-                      mfx_data = mfx_r.json()
-                      for ev in mfx_data.get("calendar", mfx_data if isinstance(mfx_data, list) else []):
-                          if ev.get("actual"):
-                              key = ev.get("name","") or ev.get("title","")
-                              actual_map[key] = ev.get("actual","")
-                      print(f"actual 있는 항목: {len(actual_map)}건")
-                  except Exception as e:
-                      print(f"MyFXBook 파싱 오류: {e}")
+              ff_html = requests.get("https://www.forexfactory.com/calendar", headers=headers, timeout=15)
+              print(f"FF HTML status: {ff_html.status_code}")
+              if ff_html.status_code == 200:
+                  soup = BeautifulSoup(ff_html.text, "html.parser")
+                  rows = soup.select("tr.calendar__row")
+                  print(f"FF HTML rows: {len(rows)}")
+                  for row in rows[:5]:
+                      title = row.select_one(".calendar__event-title")
+                      actual = row.select_one(".calendar__actual")
+                      if title and actual:
+                          print(f"  {title.text.strip()[:30]} | actual: {actual.text.strip()}")
+                          actual_map[title.text.strip()] = actual.text.strip()
+              else:
+                  print(f"FF HTML body: {ff_html.text[:200]}")
           except Exception as e:
-              print(f"MyFXBook error: {e}")
+              print(f"FF HTML error: {e}")
 
-          # ── 3. ForexFactory 필터 + push ──
+          # ForexFactory JSON
+          ff_items = []
+          json_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+          for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json"]:
+              try:
+                  r = requests.get(url, headers=json_headers, timeout=15)
+                  if r.status_code == 200:
+                      ff_items.extend(r.json())
+                      print(f"FF JSON: {len(r.json())}건")
+              except Exception as e:
+                  print(f"FF JSON error: {e}")
+
           TARGET_COUNTRIES = {"USD", "JPY"}
           TARGET_IMPACTS   = {"High", "Medium"}
-          filtered = [
-              ev for ev in ff_items
-              if ev.get("country","") in TARGET_COUNTRIES
-              and ev.get("impact","") in TARGET_IMPACTS
-          ]
-          print(f"FF 필터 후: {len(filtered)}건")
+          filtered = [ev for ev in ff_items
+                      if ev.get("country","") in TARGET_COUNTRIES
+                      and ev.get("impact","") in TARGET_IMPACTS]
 
           def parse_jst(date_str):
               try:
                   dt = datetime.fromisoformat(date_str)
-                  dt_jst = dt.astimezone(JST)
-                  return dt_jst.strftime("%Y-%m-%d"), dt_jst.strftime("%H:%M")
-              except Exception:
-                  return date_str[:10], date_str[11:16] if len(date_str) > 10 else "00:00"
+                  return dt.astimezone(JST).strftime("%Y-%m-%d"), dt.astimezone(JST).strftime("%H:%M")
+              except:
+                  return date_str[:10], "00:00"
 
           push_items = []
           for ev in filtered:
               date_jst, time_jst = parse_jst(ev.get("date",""))
               title = ev.get("title","")
-              # actual 값 매핑 시도
               actual = ev.get("actual","") or actual_map.get(title, "")
               push_items.append({
-                  "title":    title,
-                  "currency": ev.get("country",""),
-                  "impact":   ev.get("impact",""),
-                  "date":     date_jst,
-                  "time":     time_jst,
+                  "title": title, "currency": ev.get("country",""),
+                  "impact": ev.get("impact",""), "date": date_jst, "time": time_jst,
                   "forecast": ev.get("forecast","") or "",
                   "previous": ev.get("previous","") or "",
-                  "actual":   actual,
+                  "actual": actual,
               })
 
+          print(f"actual 있는 항목: {sum(1 for p in push_items if p['actual'])}건")
+
           if push_items:
-              VPS = "https://jpstocklive.com/api/push/ff_events"
-              res = requests.post(VPS, json={"items": push_items}, timeout=30)
+              res = requests.post("https://jpstocklive.com/api/push/ff_events",
+                                  json={"items": push_items}, timeout=30)
               print(f"VPS push: {res.status_code} | {res.text[:100]}")
           PYEOF
