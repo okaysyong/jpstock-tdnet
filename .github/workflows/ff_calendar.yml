@@ -25,31 +25,56 @@ jobs:
               "Accept-Language": "ja,en-US;q=0.9",
           }
 
-          # 통화 판단 키워드
-          USD_KW = ["米","FRB","FOMC","ISM","NFP","MBA","ダウ","ナスダック","連邦","財務省","ADP",
-                    "CPI","PPI","GDP","PCE","PMI","ISM","雇用統計","消費者信頼","住宅着工",
-                    "小売売上","貿易収支","鉱工業生産指数（米）","Fed","Dollar"]
-          JPY_KW = ["日銀","日本","国内","日経","円","BOJ","短観","景況","対外","対内","設備稼働",
-                    "鉱工業生産[","生産者物価","消費者物価（日","RICS","BSI","機械受注"]
+          # 명확한 JPY 키워드 (일본 발표 지표)
+          JPY_KW = [
+              "国内企業物価", "日銀", "BOJ", "景況判断BSI", "短観",
+              "対外証券投資", "対内証券投資", "機械受注", "月次GDP",
+              "鉱工業生産指数", "設備稼働率", "完全失業率", "有効求人",
+              "家計調査", "第.*四半期.*景況", "RICS住宅価格",
+              "国内", "前月比.*円", "前年比.*円",
+          ]
+          # 명확한 USD 키워드
+          USD_KW = [
+              "MBA住宅ローン", "原油在庫", "ガソリン在庫", "留出油在庫",
+              "米.*CPI", "米.*PPI", "米.*GDP", "米.*PMI", "米.*ISM",
+              "FRB", "FOMC", "連邦", "ADP雇用", "非農業部門",
+              "新規失業保険", "消費者信頼指数.*米", "ミシガン大学",
+              "MBA", "EIA", "Baker Hughes",
+          ]
+          # 영어 제목 패턴 → USD
+          ENG_USD = [
+              "Bill Auction", "Bond Auction", "CPI", "PPI", "PMI", "ISM",
+              "NFP", "GDP", "PCE", "Core", "Retail", "Housing",
+              "Unemployment", "Jobless", "Fed", "FOMC", "Capacity",
+              "Industrial Production", "Consumer", "Producer",
+          ]
 
-          def guess_currency(title, img_src=""):
-              """제목/이미지로 통화 판단"""
-              src = img_src.lower()
-              if "us_" in src or "usa" in src or "america" in src or "dollar" in src:
-                  return "USD"
-              if "jp_" in src or "japan" in src or "yen" in src:
-                  return "JPY"
-              # 제목 키워드
+          def guess_currency(title, time_str):
+              # 명확한 JPY
+              for kw in JPY_KW:
+                  if re.search(kw, title):
+                      return "JPY"
+              # 명확한 USD
               for kw in USD_KW:
+                  if re.search(kw, title):
+                      return "USD"
+              # 영어 제목 → USD
+              for kw in ENG_USD:
                   if kw in title:
                       return "USD"
-              for kw in JPY_KW:
-                  if kw in title:
+              # 시간대로 판단
+              try:
+                  h = int(time_str.split(":")[0])
+                  if 8 <= h <= 14:   # 일본 발표 시간대
                       return "JPY"
-              # 영어 제목 → 대부분 USD
-              if re.search(r'[A-Z]{2,}', title):
-                  return "USD"
-              return "JPY"  # 기본값
+                  if 20 <= h <= 23:  # 미국 발표 시간대
+                      return "USD"
+              except:
+                  pass
+              # 일본어 제목이면 JPY
+              if re.search(r'[\u3040-\u9fff]', title):
+                  return "JPY"
+              return "USD"
 
           # ── nikkei225jp.com 스크래핑 ──
           nk_events = []
@@ -71,15 +96,11 @@ jobs:
                           texts = [c.get_text(strip=True) for c in cells]
                           if not texts:
                               continue
-
-                          # 날짜 행
                           if len(texts) == 1 and re.match(r'\d+/\d+', texts[0]):
                               m = re.match(r'(\d+)/(\d+)', texts[0])
                               if m:
                                   current_date = f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
                               continue
-
-                          # 데이터 행
                           if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]):
                               time_str = texts[0]
                               stars    = texts[1].count("★")
@@ -87,12 +108,7 @@ jobs:
                               actual   = texts[3]
                               forecast = texts[4]
                               previous = texts[5]
-
-                              # 이미지 src로 통화 판단
-                              img = cells[2].find("img") if len(cells) > 2 else None
-                              img_src = img.get("src","") if img else ""
-                              currency = guess_currency(title, img_src)
-
+                              currency = guess_currency(title, time_str)
                               if current_date and stars >= 2:
                                   nk_events.append({
                                       "date": current_date, "time": time_str,
@@ -101,19 +117,17 @@ jobs:
                                       "currency": currency, "stars": stars,
                                   })
 
-                  print(f"파싱: {len(nk_events)}건")
-                  # 통화 분포 확인
                   usd = sum(1 for e in nk_events if e["currency"]=="USD")
                   jpy = sum(1 for e in nk_events if e["currency"]=="JPY")
-                  print(f"  USD:{usd} JPY:{jpy}")
-                  for ev in nk_events[:5]:
-                      print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:25]} | actual={ev['actual']}")
+                  print(f"파싱: {len(nk_events)}건 (USD:{usd} JPY:{jpy})")
+                  for ev in nk_events[:6]:
+                      print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:28]} | actual={ev['actual']}")
 
           except Exception as e:
-              print(f"nikkei225jp error: {e}")
+              print(f"error: {e}")
               import traceback; traceback.print_exc()
 
-          # ── ForexFactory JSON (미래 일정 보완) ──
+          # ── ForexFactory JSON ──
           ff_items = []
           for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
                       "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
@@ -121,9 +135,8 @@ jobs:
                   res = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
                   if res.status_code == 200:
                       ff_items.extend(res.json())
-                      print(f"FF {url.split('/')[-1]}: {len(res.json())}건")
-              except Exception as e:
-                  print(f"FF error: {e}")
+              except: pass
+          print(f"FF: {len(ff_items)}건")
 
           def parse_jst(s):
               try:
@@ -132,18 +145,16 @@ jobs:
               except:
                   return s[:10], "00:00"
 
-          # nikkei225jp → push
           push_items = []
           for ev in nk_events:
-              impact = "High" if ev["stars"] >= 4 else "Medium"
               push_items.append({
                   "title": ev["title"], "currency": ev["currency"],
-                  "impact": impact, "date": ev["date"], "time": ev["time"],
+                  "impact": "High" if ev["stars"] >= 4 else "Medium",
+                  "date": ev["date"], "time": ev["time"],
                   "forecast": ev["forecast"], "previous": ev["previous"],
                   "actual": ev["actual"],
               })
 
-          # FF 미래 일정 보완 (nikkei225jp에 없는 것)
           nk_keys = {(ev["date"], ev["time"][:5]) for ev in nk_events}
           for ev in ff_items:
               if ev.get("country") not in ("USD","JPY"): continue
@@ -159,7 +170,6 @@ jobs:
                   })
 
           print(f"총 push: {len(push_items)}건 (actual: {sum(1 for p in push_items if p['actual'])}건)")
-
           if push_items:
               res = requests.post("https://jpstocklive.com/api/push/ff_events",
                                   json={"items": push_items}, timeout=30)
