@@ -20,69 +20,66 @@ jobs:
           JST = timezone(timedelta(hours=9))
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-              "Accept": "text/html,application/xhtml+xml",
-              "Accept-Language": "en-US,en;q=0.9",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "ja,en-US;q=0.9",
           }
 
-          # ForexFactory HTML 스크래핑 시도
+          # ── nikkei225jp.com 스크래핑 ──
           actual_map = {}
           try:
-              ff_html = requests.get("https://www.forexfactory.com/calendar", headers=headers, timeout=15)
-              print(f"FF HTML status: {ff_html.status_code}")
-              if ff_html.status_code == 200:
-                  soup = BeautifulSoup(ff_html.text, "html.parser")
-                  rows = soup.select("tr.calendar__row")
-                  print(f"FF HTML rows: {len(rows)}")
-                  for row in rows[:5]:
-                      title = row.select_one(".calendar__event-title")
-                      actual = row.select_one(".calendar__actual")
-                      if title and actual:
-                          print(f"  {title.text.strip()[:30]} | actual: {actual.text.strip()}")
-                          actual_map[title.text.strip()] = actual.text.strip()
+              r = requests.get("https://nikkei225jp.com/schedule/", headers=headers, timeout=15)
+              print(f"nikkei225jp status: {r.status_code}")
+              if r.status_code == 200:
+                  soup = BeautifulSoup(r.text, "html.parser")
+                  # 테이블 구조 파악
+                  tables = soup.find_all("table")
+                  print(f"테이블 수: {len(tables)}")
+                  for table in tables[:2]:
+                      rows = table.find_all("tr")
+                      print(f"  행 수: {len(rows)}")
+                      for row in rows[:5]:
+                          cells = [td.get_text(strip=True) for td in row.find_all(["td","th"])]
+                          if cells:
+                              print(f"  {cells}")
               else:
-                  print(f"FF HTML body: {ff_html.text[:200]}")
+                  print(f"응답: {r.text[:200]}")
           except Exception as e:
-              print(f"FF HTML error: {e}")
+              print(f"nikkei225jp error: {e}")
 
-          # ForexFactory JSON
+          # ForexFactory JSON (기존)
           ff_items = []
-          json_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+          ff_headers = {"User-Agent": "Mozilla/5.0"}
           for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json"]:
               try:
-                  r = requests.get(url, headers=json_headers, timeout=15)
-                  if r.status_code == 200:
-                      ff_items.extend(r.json())
-                      print(f"FF JSON: {len(r.json())}건")
+                  res = requests.get(url, headers=ff_headers, timeout=15)
+                  if res.status_code == 200:
+                      ff_items.extend(res.json())
+                      print(f"FF JSON: {len(res.json())}건")
               except Exception as e:
-                  print(f"FF JSON error: {e}")
+                  print(f"FF error: {e}")
 
-          TARGET_COUNTRIES = {"USD", "JPY"}
-          TARGET_IMPACTS   = {"High", "Medium"}
-          filtered = [ev for ev in ff_items
-                      if ev.get("country","") in TARGET_COUNTRIES
-                      and ev.get("impact","") in TARGET_IMPACTS]
+          TARGET = {"USD","JPY"}
+          IMPACT = {"High","Medium"}
+          filtered = [ev for ev in ff_items if ev.get("country") in TARGET and ev.get("impact") in IMPACT]
+          print(f"FF 필터: {len(filtered)}건")
 
-          def parse_jst(date_str):
+          def parse_jst(s):
               try:
-                  dt = datetime.fromisoformat(date_str)
-                  return dt.astimezone(JST).strftime("%Y-%m-%d"), dt.astimezone(JST).strftime("%H:%M")
+                  dt = datetime.fromisoformat(s).astimezone(JST)
+                  return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
               except:
-                  return date_str[:10], "00:00"
+                  return s[:10], "00:00"
 
           push_items = []
           for ev in filtered:
-              date_jst, time_jst = parse_jst(ev.get("date",""))
-              title = ev.get("title","")
-              actual = ev.get("actual","") or actual_map.get(title, "")
+              d, t = parse_jst(ev.get("date",""))
               push_items.append({
-                  "title": title, "currency": ev.get("country",""),
-                  "impact": ev.get("impact",""), "date": date_jst, "time": time_jst,
+                  "title": ev.get("title",""), "currency": ev.get("country",""),
+                  "impact": ev.get("impact",""), "date": d, "time": t,
                   "forecast": ev.get("forecast","") or "",
                   "previous": ev.get("previous","") or "",
-                  "actual": actual,
+                  "actual":   ev.get("actual","")   or "",
               })
-
-          print(f"actual 있는 항목: {sum(1 for p in push_items if p['actual'])}건")
 
           if push_items:
               res = requests.post("https://jpstocklive.com/api/push/ff_events",
