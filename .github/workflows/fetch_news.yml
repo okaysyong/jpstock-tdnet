@@ -34,14 +34,12 @@ jobs:
           VPS_TOKEN = os.environ.get("VPS_TOKEN", "")
 
           RSS_FEEDS = [
-              ("yahoo_finance", "https://finance.yahoo.co.jp/rss/news"),
-              ("yahoo_biz", "https://news.yahoo.co.jp/rss/topics/business.xml"),
-              ("yahoo_stock", "https://news.yahoo.co.jp/rss/topics/stock.xml"),
+              # Yahoo Finance 경제뉴스
+              ("yahoo_finance", "https://news.yahoo.co.jp/rss/topics/business.xml"),
+              # NHK 경제 (cat4) — 기업/경제 특화
               ("nhk_cat4", "https://www.nhk.or.jp/rss/news/cat4.xml"),
+              # NHK 사회 (cat5) — 기업 관련 사건
               ("nhk_cat5", "https://www.nhk.or.jp/rss/news/cat5.xml"),
-              ("nhk_cat7", "https://www.nhk.or.jp/rss/news/cat7.xml"),
-              ("minkabu", "https://minkabu.jp/news/rss"),
-              ("reuters_jp", "https://jp.reuters.com/rssFeed/businessNews"),
           ]
 
           EXCLUDE_KW = [
