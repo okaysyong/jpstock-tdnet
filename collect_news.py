@@ -1,7 +1,7 @@
 """
 collect_news.py
 GitHub Actions에서 실행 — NHK/Yahoo/Investing.com RSS 수집 → VPS push
-평일/주말 관계없이 30분마다 실행
+평일/주말 관계없이 5분마다 실행
 """
 import os, re, time, hashlib, json
 from datetime import datetime, timezone, timedelta
@@ -19,45 +19,53 @@ HEADERS = {
 }
 
 RSS_FEEDS = [
-    # NHK (www.nhk.or.jp만 작동, www3는 차단됨)
-    ("nhk_eco",   "https://www.nhk.or.jp/rss/news/cat6.xml"),   # 경제
-    ("nhk_world", "https://www.nhk.or.jp/rss/news/cat4.xml"),   # 국제
-    ("nhk_top",   "https://www.nhk.or.jp/rss/news/cat0.xml"),   # 주요
-    ("nhk_biz",   "https://www.nhk.or.jp/rss/news/cat5.xml"),   # 정치
-    ("nhk_sci",   "https://www.nhk.or.jp/rss/news/cat7.xml"),   # 과학/문화
+    # NHK 경제 특화 카테고리만
+    ("nhk_biz",   "https://www.nhk.or.jp/rss/news/cat5.xml"),   # 경제/기업
+    ("nhk_world", "https://www.nhk.or.jp/rss/news/cat4.xml"),   # 국제경제
+    ("nhk_eco",   "https://www.nhk.or.jp/rss/news/cat6.xml"),   # 과학/기술
     # Yahoo Finance JP
     ("yahoo_fin", "https://finance.yahoo.co.jp/rss/news"),
+    # Yahoo IT/비즈니스
+    ("yahoo_it",  "https://news.yahoo.co.jp/rss/topics/it.xml"),
+    ("yahoo_biz", "https://news.yahoo.co.jp/rss/topics/business.xml"),
 ]
 
-# 제외 키워드
+# 제외 키워드 (증권 무관 완전 차단)
 EXCLUDE_KW = [
-    # 유럽/해외 개별주식 (Investing.com)
-    "株が本日", "株価が本日", "の株価", "急落した理由", "急騰した理由", "下落した理由", "上昇している理由",
-    "Infineon", "Italgas", "Unipol", "BPER", "Molten", "Ital", "Oxford",
-    "KOSPI", "ファーマ株", "ベンチャーズ株",
-    # 암호화폐/NFT
-    "ビットコイン", "暗号資産", "仮想通貨", "NFT", "ブロックチェーン", "トークン",
-    "Coincheck", "GMOコイン", "OKCoin", "Kraken", "XRP", "Solana", "Cardano",
-    "エアドロップ", "ステーキング", "ウォレット", "取引所", "DeFi", "Web3",
-    # 일본 국내 정치 (주식 무관)
-    "旧皇族", "無戸籍", "知床", "国旗損壊", "皇族", "養子", "戸籍",
-    "参政", "立民", "公明", "維新", "国民民主", "れいわ",
-    "参院幹事長", "衆院", "参院", "委員会で可決", "法案",
-    # 외교 (주식 무관)
-    "外相", "モンゴル", "次官級", "戦略対話",
-    # 스포츠
+    # 스포츠 — 종목
     "サッカー", "野球", "バスケ", "テニス", "ゴルフ", "ラグビー", "五輪",
     "オリンピック", "W杯", "ワールドカップ", "高校野球", "Jリーグ", "プロ野球",
     "カーリング", "スケート", "水泳", "体操", "柔道", "相撲", "レスリング",
     "マラソン", "陸上", "バレー", "バドミントン", "卓球", "ボクシング",
-    "選手権", "リーグ戦", "試合", "優勝", "得点", "監督",
+    # 스포츠 — 표현
+    "選手権", "リーグ戦", "優勝", "監督", "コーチ", "得点", "失点",
+    "ホームラン", "打点", "登板", "先発", "完投",
+    # 스포츠 — 선수 이름
+    "大谷翔平", "佐々木朗希", "鈴木誠也", "松井裕樹", "山本由伸",
+    "ドジャース", "ヤンキース", "パドレス", "カブス", "アストロズ",
+    "ホワイトソックス", "ブルージェイズ", "オリオールズ",
     # 연예/문화
     "芸能", "アイドル", "歌手", "俳優", "映画", "ドラマ", "コンサート",
     "音楽", "エンタメ", "バラエティ", "漫画", "アニメ",
-    # 사건사고/재해
-    "交通事故", "火災", "逮捕", "容疑者", "殺人", "詐欺被害", "窃盗",
-    "地震", "津波", "台風", "災害", "死者", "負傷者", "避難", "震度",
+    # 날씨/재해
+    "台風", "大雨", "洪水", "土砂", "ひょう", "雷", "竜巻",
+    "熱中症", "梅雨", "積雪", "大雪", "津波", "震度",
+    # 사건사고
+    "交通事故", "火災", "逮捕", "容疑者", "殺人", "詐欺被害", "窃盗", "強盗",
+    "行方不明", "死亡事故", "遺体", "けが人",
+    # 황실/정치 (경제 무관)
+    "天皇", "皇后", "皇室", "陛下", "皇太子", "皇族",
+    "旧皇族", "知床", "参政", "立民", "公明", "維新",
+    "衆院", "参院", "委員会で可決", "法案",
+    # 외교 (경제 무관)
+    "表敬訪問", "記念式典", "慰霊", "追悼",
+    # 암호화폐
+    "ビットコイン", "暗号資産", "仮想通貨", "NFT", "ブロックチェーン",
+    # 기타
+    "グルメ", "食べ歩き", "観光", "旅行", "温泉", "スイーツ",
     "スポーツ協会", "体育協会",
+    # 생활
+    "スイカ", "アライグマ", "クレーンゲーム", "スムージー", "弱冷車",
 ]
 
 # 중요도 키워드
@@ -65,23 +73,19 @@ HIGH_KW = [
     "日銀", "BOJ", "金利", "FOMC", "FRB", "GDP", "CPI", "PCE",
     "利上げ", "利下げ", "関税", "決算", "業績修正", "TOB", "合併",
     "上場廃止", "破産", "民事再生", "円高", "円安", "半導体",
+    "上場", "IPO", "増資", "自社株買い", "配当",
 ]
 
 
-def _uid(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()[:12]
+def _uid(source: str, title: str) -> str:
+    return hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
 
 
 def _parse_rss(xml_text: str, source: str) -> list:
     items = []
     try:
-        # feedparser 없으므로 ET 직접 파싱
         xml_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', xml_text)
         root = ET.fromstring(xml_text)
-        ns_map = {
-            'dc': 'http://purl.org/dc/elements/1.1/',
-            'content': 'http://purl.org/rss/1.0/modules/content/',
-        }
         ch = root.find("channel")
         entries = ch.findall("item") if ch is not None else root.findall(".//item")
 
@@ -92,12 +96,11 @@ def _parse_rss(xml_text: str, source: str) -> list:
 
             title = _t("title")
             url   = _t("link") or _t("guid")
-            pub   = _t("pubDate") or _t("dc:date") or ""
+            pub   = _t("pubDate") or ""
 
             if not title or not url:
                 continue
 
-            # 날짜 파싱
             pub_dt = None
             for fmt in [
                 "%a, %d %b %Y %H:%M:%S %z",
@@ -117,13 +120,12 @@ def _parse_rss(xml_text: str, source: str) -> list:
             pub_jst = pub_dt.astimezone(JST)
             pub_str = pub_jst.strftime("%Y-%m-%d %H:%M:%S")
 
-            # 오래된 뉴스 제외 (24시간 이상)
             age_min = int((datetime.now(timezone.utc) - pub_dt.astimezone(timezone.utc)).total_seconds() / 60)
             if age_min > 1440:
                 continue
 
             items.append({
-                "uid":          _uid(url),
+                "uid":          _uid(source, title),
                 "title":        title,
                 "summary":      "",
                 "url":          url,
@@ -148,13 +150,11 @@ def fetch_rss(source: str, url: str) -> list:
             return []
         items = _parse_rss(res.text, source)
 
-        # 제외 키워드 필터
         filtered = []
         for item in items:
             title = item.get("title", "")
             if any(kw in title for kw in EXCLUDE_KW):
                 continue
-            # 중요도 점수
             score = 3 if any(kw in title for kw in HIGH_KW) else 2
             item["score"] = score
             filtered.append(item)
