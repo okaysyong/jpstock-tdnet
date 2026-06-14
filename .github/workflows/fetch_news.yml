@@ -1,0 +1,146 @@
+name: JP Stock News Fetcher
+
+on:
+  schedule:
+    # 평일 08:00~16:00 JST (UTC 23:00~07:00) → 5분마다
+    - cron: '*/5 23-23 * * 0-4'  # JST 08:00~08:59
+    - cron: '*/5 0-6 * * 1-5'    # JST 09:00~15:59
+    - cron: '*/5 7-7 * * 1-5'    # JST 16:00~16:59
+    # 주말에도 3시간마다 (글로벌 뉴스)
+    - cron: '0 */3 * * 6,0'
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  fetch-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests feedparser pytz
+
+      - name: Fetch and push news
+        env:
+          VPS_URL: ${{ secrets.VPS_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import requests, feedparser, json, time, hashlib
+          from datetime import datetime, timezone, timedelta
+
+          JST = timezone(timedelta(hours=9))
+          VPS_URL = "${{ env.VPS_URL }}" or "https://jpstocklive.com"
+          VPS_TOKEN = "${{ env.VPS_TOKEN }}" or ""
+
+          # ── 증권 특화 RSS 피드 ────────────────────────────────
+          RSS_FEEDS = [
+              # Yahoo Finance JP
+              ("yahoo_finance", "https://finance.yahoo.co.jp/rss/news"),
+              # Yahoo 비즈니스
+              ("yahoo_biz", "https://news.yahoo.co.jp/rss/topics/business.xml"),
+              # Yahoo 주식
+              ("yahoo_stock", "https://news.yahoo.co.jp/rss/topics/stock.xml"),
+              # NHK 경제
+              ("nhk_cat4", "https://www.nhk.or.jp/rss/news/cat4.xml"),
+              # NHK 사회 (기업 관련)
+              ("nhk_cat5", "https://www.nhk.or.jp/rss/news/cat5.xml"),
+              # NHK 국제 (지정학)
+              ("nhk_cat7", "https://www.nhk.or.jp/rss/news/cat7.xml"),
+              # Minkabu
+              ("minkabu", "https://minkabu.jp/news/rss"),
+              # Reuters JP
+              ("reuters_jp", "https://jp.reuters.com/rssFeed/businessNews"),
+          ]
+
+          # ── 제외 키워드 (증권 무관) ──────────────────────────
+          EXCLUDE_KW = [
+              # 스포츠
+              "サッカー","野球","バスケ","テニス","ゴルフ","ラグビー","五輪",
+              "オリンピック","W杯","ワールドカップ","高校野球","Jリーグ","プロ野球",
+              "大リーグ","MLB","NFL","NBA","ドジャース","ヤンキース","大谷","佐々木",
+              "鈴木誠","松井","ホームラン","打点","先発","登板","監督","コーチ",
+              "大相撲","力士","横綱","優勝","金メダル","銀メダル",
+              # 연예/문화
+              "芸能","アイドル","歌手","俳優","映画","ドラマ","コンサート","音楽",
+              # 날씨/재해
+              "台風","地震","津波","大雨","洪水","土砂","ひょう","雷","竜巻",
+              "気温","熱中症","梅雨","積雪","大雪",
+              # 사건사고
+              "交通事故","火災","逮捕","容疑者","殺人","詐欺被害","強盗",
+              "行方不明","遺体","死亡","けが","事件",
+              # 외교/정치 (경제 무관)
+              "表敬訪問","首脳会談","外相会談","記念式典","慰霊","追悼",
+              "サミット参加","演説","訪問","到着",
+              # 스포츠 행사
+              "スポーツ協会","スポーツ庁","体育協会","マラソン","駅伝",
+              # 기타
+              "グルメ","食べ歩き","観光","旅行","宿泊","温泉",
+              "天皇","皇后","皇室","陛下","皇太子",
+          ]
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (compatible; JPStockLiveBot/1.0)",
+              "Accept": "application/rss+xml, application/xml, text/xml, */*",
+          }
+
+          all_news = []
+          for source, url in RSS_FEEDS:
+              try:
+                  r = requests.get(url, timeout=10, headers=headers)
+                  if r.status_code != 200:
+                      print(f"  ⚠️  {source}: {r.status_code}")
+                      continue
+                  feed = feedparser.parse(r.text)
+                  count = 0
+                  for entry in feed.entries[:30]:
+                      title = (entry.get("title") or "").strip()
+                      if not title:
+                          continue
+                      # 제외 키워드 필터
+                      if any(kw in title for kw in EXCLUDE_KW):
+                          continue
+                      # UID 생성
+                      uid = hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
+                      # 발행 시간
+                      try:
+                          published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+                      except:
+                          published = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+                      all_news.append({
+                          "uid": uid,
+                          "title": title,
+                          "summary": (entry.get("summary") or "")[:300],
+                          "url": entry.get("link") or "",
+                          "source": source,
+                          "published_at": published,
+                      })
+                      count += 1
+                  print(f"  ✅ {source}: {count}건")
+              except Exception as e:
+                  print(f"  ❌ {source}: {e}")
+              time.sleep(1)
+
+          print(f"\n총 {len(all_news)}건 수집 완료")
+
+          if not all_news:
+              print("뉴스 없음 — 종료")
+              exit(0)
+
+          # VPS로 전송
+          try:
+              res = requests.post(
+                  f"{VPS_URL}/push/news",
+                  json={"items": all_news, "token": VPS_TOKEN},
+                  timeout=15,
+                  headers={"Content-Type": "application/json"}
+              )
+              print(f"VPS 전송: {res.status_code} — {res.text[:100]}")
+          except Exception as e:
+              print(f"VPS 전송 오류: {e}")
+          PYEOF
