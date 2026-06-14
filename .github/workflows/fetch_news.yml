@@ -1,146 +1,2141 @@
-name: JP Stock News Fetcher
+# -*- coding: utf-8 -*-
+"""
+news_server.py — JP Market Live VPS 뉴스/공시 수집 서버
+════════════════════════════════════════════════════════
+역할:
+  - 24시간 RSS 뉴스 수집 (5분마다)
+  - TDnet 공시 수집 (5분마다)
+  - SQLite DB 저장 (30일 자동 청소)
+  - FastAPI로 미니PC broadcast.py에 REST API 제공
 
-on:
-  schedule:
-    # 평일 08:00~16:00 JST (UTC 23:00~07:00) → 5분마다
-    - cron: '*/5 23-23 * * 0-4'  # JST 08:00~08:59
-    - cron: '*/5 0-6 * * 1-5'    # JST 09:00~15:59
-    - cron: '*/5 7-7 * * 1-5'    # JST 16:00~16:59
-    # 주말에도 3시간마다 (글로벌 뉴스)
-    - cron: '0 */3 * * 6,0'
-  workflow_dispatch:  # 수동 실행 가능
+API 엔드포인트:
+  GET /news          → 최신 뉴스 목록 (max=50, max_age_min=1440)
+  GET /news/{uid}    → 특정 뉴스 조회
+  GET /tdnet         → 최신 공시 목록 (rank>=2, hours=24)
+  GET /health        → 서버 상태 확인
 
-jobs:
-  fetch-news:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
+실행:
+  uvicorn news_server:app --host 0.0.0.0 --port 8900
+"""
 
-    steps:
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+import os
+import re
+import json
+import time
+import hashlib
+import sqlite3
+import threading
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List
+from contextlib import contextmanager
 
-      - name: Install dependencies
-        run: pip install requests feedparser pytz
+import requests
 
-      - name: Fetch and push news
-        env:
-          VPS_URL: ${{ secrets.VPS_URL }}
-          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
-        run: |
-          python3 << 'PYEOF'
-          import requests, feedparser, json, time, hashlib
-          from datetime import datetime, timezone, timedelta
+# ── FastAPI (설치: pip install fastapi uvicorn) ──
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
-          JST = timezone(timedelta(hours=9))
-          VPS_URL = "${{ env.VPS_URL }}" or "https://jpstocklive.com"
-          VPS_TOKEN = "${{ env.VPS_TOKEN }}" or ""
+# ─────────────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────────────
+JST         = timezone(timedelta(hours=9))
+DB_PATH     = os.path.join(os.path.dirname(__file__), "news_data.db")
+LOG_PATH    = os.path.join(os.path.dirname(__file__), "news_server.log")
+NEWS_RETAIN_DAYS   = 30   # 뉴스 보관 일수
+TDNET_RETAIN_DAYS  = 30   # 공시 보관 일수
+FETCH_INTERVAL     = 300  # 수집 주기 (초) = 5분
+GPT_RANK_INTERVAL  = 600  # GPT 랭킹 주기 (초) = 10분
 
-          # ── 증권 특화 RSS 피드 ────────────────────────────────
-          RSS_FEEDS = [
-              # Yahoo Finance JP
-              ("yahoo_finance", "https://finance.yahoo.co.jp/rss/news"),
-              # Yahoo 비즈니스
-              ("yahoo_biz", "https://news.yahoo.co.jp/rss/topics/business.xml"),
-              # Yahoo 주식
-              ("yahoo_stock", "https://news.yahoo.co.jp/rss/topics/stock.xml"),
-              # NHK 경제
-              ("nhk_cat4", "https://www.nhk.or.jp/rss/news/cat4.xml"),
-              # NHK 사회 (기업 관련)
-              ("nhk_cat5", "https://www.nhk.or.jp/rss/news/cat5.xml"),
-              # NHK 국제 (지정학)
-              ("nhk_cat7", "https://www.nhk.or.jp/rss/news/cat7.xml"),
-              # Minkabu
-              ("minkabu", "https://minkabu.jp/news/rss"),
-              # Reuters JP
-              ("reuters_jp", "https://jp.reuters.com/rssFeed/businessNews"),
-          ]
+# OpenAI API 키 (환경변수)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+PUSH_TOKEN   = os.getenv("PUSH_TOKEN", "7902580b8e732fc8249199070963cb5a")  # GitHub Actions 인증 토큰
 
-          # ── 제외 키워드 (증권 무관) ──────────────────────────
-          EXCLUDE_KW = [
-              # 스포츠
-              "サッカー","野球","バスケ","テニス","ゴルフ","ラグビー","五輪",
-              "オリンピック","W杯","ワールドカップ","高校野球","Jリーグ","プロ野球",
-              "大リーグ","MLB","NFL","NBA","ドジャース","ヤンキース","大谷","佐々木",
-              "鈴木誠","松井","ホームラン","打点","先発","登板","監督","コーチ",
-              "大相撲","力士","横綱","優勝","金メダル","銀メダル",
-              # 연예/문화
-              "芸能","アイドル","歌手","俳優","映画","ドラマ","コンサート","音楽",
-              # 날씨/재해
-              "台風","地震","津波","大雨","洪水","土砂","ひょう","雷","竜巻",
-              "気温","熱中症","梅雨","積雪","大雪",
-              # 사건사고
-              "交通事故","火災","逮捕","容疑者","殺人","詐欺被害","強盗",
-              "行方不明","遺体","死亡","けが","事件",
-              # 외교/정치 (경제 무관)
-              "表敬訪問","首脳会談","外相会談","記念式典","慰霊","追悼",
-              "サミット参加","演説","訪問","到着",
-              # 스포츠 행사
-              "スポーツ協会","スポーツ庁","体育協会","マラソン","駅伝",
-              # 기타
-              "グルメ","食べ歩き","観光","旅行","宿泊","温泉",
-              "天皇","皇后","皇室","陛下","皇太子",
-          ]
+# GPT 랭킹 캐시
+_gpt_rank_cache: dict = {
+    "world": [],   # [{title, time_str, url, impact}, ...]
+    "japan": [],
+    "ranked_uids": [],
+    "updated_at": 0.0,
+}
+_last_gpt_rank_ts: float = 0.0
 
-          headers = {
-              "User-Agent": "Mozilla/5.0 (compatible; JPStockLiveBot/1.0)",
-              "Accept": "application/rss+xml, application/xml, text/xml, */*",
-          }
+# RSS 피드 목록 (broadcast.py와 동일 + 추가)
+RSS_FEEDS = [
+    "https://finance.yahoo.co.jp/rss/news",
+    "https://www.nhk.or.jp/rss/news/cat6.xml",      # NHK 경제
+    "https://feeds.reuters.com/reuters/JPBusinessNews",  # Reuters JP
+    "https://www.bloomberg.co.jp/feeds/bpol/news",   # Bloomberg JP (공개)
+]
 
-          all_news = []
-          for source, url in RSS_FEEDS:
-              try:
-                  r = requests.get(url, timeout=10, headers=headers)
-                  if r.status_code != 200:
-                      print(f"  ⚠️  {source}: {r.status_code}")
-                      continue
-                  feed = feedparser.parse(r.text)
-                  count = 0
-                  for entry in feed.entries[:30]:
-                      title = (entry.get("title") or "").strip()
-                      if not title:
-                          continue
-                      # 제외 키워드 필터
-                      if any(kw in title for kw in EXCLUDE_KW):
-                          continue
-                      # UID 생성
-                      uid = hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
-                      # 발행 시간
-                      try:
-                          published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
-                      except:
-                          published = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+# 제외 키워드 (스포츠/연예 등)
+EXCLUDE_KW = [
+    # 스포츠
+    "サッカー","野球","バスケ","テニス","ゴルフ","ラグビー","五輪",
+    "オリンピック","W杯","ワールドカップ","高校野球","Jリーグ","プロ野球",
+    "大リーグ","MLB","NFL","NBA","ドジャース","ヤンキース",
+    "大谷","佐々木朗","鈴木誠","松井裕","ホームラン","打点","登板","先発",
+    "大相撲","力士","横綱","金メダル","銀メダル","マラソン","駅伝",
+    "パドレス","カブス","アストロズ","ホワイトソックス","ブルージェイズ",
+    # 연예/문화
+    "芸能","アイドル","歌手","俳優","映画","ドラマ","コンサート","音楽",
+    # 날씨/재해
+    "台風","大雨","洪水","土砂","ひょう","雷","竜巻",
+    "熱中症","梅雨","積雪","大雪","気温上","真夏日","真冬日",
+    # 사건사고 (주가 무관)
+    "交通事故","火災","逮捕","容疑者","殺人","詐欺被害","強盗",
+    "行方不明","死亡事故","遺体","けが人",
+    # 외교/정치 (경제 무관)
+    "表敬訪問","首脳会談","外相会談","記念式典","慰霊","追悼",
+    "演説","到着","出発","訪問先",
+    # 황실
+    "天皇","皇后","皇室","陛下","皇太子","皇族",
+    # 기타
+    "グルメ","食べ歩き","観光","旅行","温泉","スイカ","お菓子","スイーツ",
+    "スポーツ協会","スポーツ庁","体育協会",
+]
 
-                      all_news.append({
-                          "uid": uid,
-                          "title": title,
-                          "summary": (entry.get("summary") or "")[:300],
-                          "url": entry.get("link") or "",
-                          "source": source,
-                          "published_at": published,
-                      })
-                      count += 1
-                  print(f"  ✅ {source}: {count}건")
-              except Exception as e:
-                  print(f"  ❌ {source}: {e}")
-              time.sleep(1)
+# 중요도 키워드
+HIGH_KW = [
+    "日銀","BOJ","金利","FOMC","FRB","GDP","CPI","PCE",
+    "利上げ","利下げ","関税","貿易戦争","決算","業績修正",
+    "TOB","合併","上場廃止","破産","民事再生",
+]
 
-          print(f"\n총 {len(all_news)}건 수집 완료")
+# 종목 키워드 매핑 (주요 종목)
+STOCK_KW = {
+    "6758": ["ソニー","ソニーG","SONY"],
+    "6861": ["キーエンス"],
+    "7203": ["トヨタ","TOYOTA"],
+    "9984": ["ソフトバンク","SoftBank"],
+    "8035": ["東京エレクトロン","TEL"],
+    "6367": ["ダイキン"],
+    "6954": ["ファナック","FANUC"],
+    "4063": ["信越化学","ShinEtsu"],
+    "9432": ["NTT"],
+    "8306": ["三菱UFJ","MUFG"],
+    "7974": ["任天堂","Nintendo"],
+    "4519": ["中外製薬"],
+    "6902": ["デンソー"],
+    "8058": ["三菱商事"],
+    "9433": ["KDDI"],
+}
 
-          if not all_news:
-              print("뉴스 없음 — 종료")
-              exit(0)
+SECTOR_KW = {
+    "半導体":  ["半導体","チップ","TSMC","NVIDIA","AI半導体"],
+    "電機":    ["電機","エレクトロニクス"],
+    "自動車":  ["自動車","EV","電気自動車"],
+    "金融":    ["銀行","金融","日銀","BOJ"],
+    "製薬":    ["製薬","バイオ","医薬品"],
+    "IT":      ["クラウド","AI","DX","デジタル"],
+    "商社":    ["資源","商社","LNG"],
+    "不動産":  ["不動産","REIT"],
+}
 
-          # VPS로 전송
-          try:
-              res = requests.post(
-                  f"{VPS_URL}/push/news",
-                  json={"items": all_news, "token": VPS_TOKEN},
-                  timeout=15,
-                  headers={"Content-Type": "application/json"}
+# ─────────────────────────────────────────────────
+# 로깅
+# ─────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────
+# DB 초기화
+# ─────────────────────────────────────────────────
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS news_feed (
+            uid          TEXT PRIMARY KEY,
+            title        TEXT NOT NULL,
+            summary      TEXT DEFAULT '',
+            url          TEXT NOT NULL,
+            source       TEXT DEFAULT '',
+            published_at TEXT NOT NULL,
+            age_min      REAL DEFAULT 0,
+            stocks       TEXT DEFAULT '[]',
+            sectors      TEXT DEFAULT '[]',
+            score        REAL DEFAULT 0,
+            created_at   TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_news_published ON news_feed(published_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_news_score     ON news_feed(score DESC);
+
+        CREATE TABLE IF NOT EXISTS company_disclosures (
+            disclosure_id   TEXT PRIMARY KEY,
+            stock_code      TEXT NOT NULL,
+            company_name    TEXT DEFAULT '',
+            title           TEXT NOT NULL,
+            disclosed_at    TEXT NOT NULL,
+            rank            INTEGER DEFAULT 1,
+            pdf_url         TEXT DEFAULT '',
+            is_processed    INTEGER DEFAULT 0,
+            created_at      TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_disc_stock ON company_disclosures(stock_code);
+        CREATE INDEX IF NOT EXISTS idx_disc_rank  ON company_disclosures(rank DESC, disclosed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS stocks (
+            code         TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            name_short   TEXT DEFAULT '',
+            market       TEXT DEFAULT '',
+            sector       TEXT DEFAULT '',
+            updated_at   TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_stocks_name ON stocks(name);
+
+        CREATE TABLE IF NOT EXISTS scheduler_logs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_name    TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            count       INTEGER DEFAULT 0,
+            error_msg   TEXT DEFAULT '',
+            started_at  TEXT NOT NULL,
+            ended_at    TEXT DEFAULT (datetime('now','localtime'))
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_news (
+            id          TEXT PRIMARY KEY,
+            code        TEXT NOT NULL DEFAULT '',
+            company     TEXT NOT NULL DEFAULT '',
+            title       TEXT NOT NULL,
+            url         TEXT NOT NULL DEFAULT '',
+            time        TEXT NOT NULL DEFAULT '',
+            date        TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'kabutan_stock',
+            category    TEXT NOT NULL DEFAULT '',
+            importance  INTEGER NOT NULL DEFAULT 1,
+            fetched_at  TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            is_used     INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_sn_code   ON stock_news(code);
+        CREATE INDEX IF NOT EXISTS idx_sn_date   ON stock_news(date DESC);
+        CREATE INDEX IF NOT EXISTS idx_sn_imp    ON stock_news(importance DESC);
+        CREATE INDEX IF NOT EXISTS idx_sn_source ON stock_news(source);
+
+        CREATE TABLE IF NOT EXISTS events (
+            id           TEXT PRIMARY KEY,
+            event_date   TEXT NOT NULL,
+            event_time   TEXT NOT NULL DEFAULT '00:00',
+            country      TEXT NOT NULL DEFAULT 'JP',
+            category     TEXT NOT NULL DEFAULT 'economic',
+            title        TEXT NOT NULL,
+            title_jp     TEXT NOT NULL DEFAULT '',
+            stars        INTEGER NOT NULL DEFAULT 3,
+            forecast     TEXT DEFAULT NULL,
+            previous     TEXT DEFAULT NULL,
+            actual       TEXT DEFAULT NULL,
+            source       TEXT NOT NULL DEFAULT 'finnhub',
+            updated_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            is_released  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_ev_date    ON events(event_date);
+        CREATE INDEX IF NOT EXISTS idx_ev_country ON events(country);
+        CREATE INDEX IF NOT EXISTS idx_ev_stars   ON events(stars DESC);
+        CREATE INDEX IF NOT EXISTS idx_ev_cat     ON events(category);
+
+        CREATE TABLE IF NOT EXISTS broadcast_cache (
+            data_type  TEXT PRIMARY KEY,
+            payload    TEXT NOT NULL,
+            saved_at   TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        """)
+        conn.commit()
+    log.info(f"✅ DB 초기화 완료: {DB_PATH}")
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────
+# 뉴스 수집
+# ─────────────────────────────────────────────────
+def _news_uid(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()[:12]
+
+def _score_news(title: str, matched_stocks: list, matched_sectors: list, age_min: float) -> float:
+    score = 0.0
+    for kw in HIGH_KW:
+        if kw in title:
+            score += 0.2
+    score += 0.15 * len(matched_stocks)
+    score += 0.10 * len(matched_sectors)
+    if age_min < 15:
+        score += 0.3
+    elif age_min < 30:
+        score += 0.1
+    return min(round(score, 2), 1.0)
+
+def fetch_rss() -> int:
+    """RSS 피드 수집 → DB 저장. 신규 건수 반환."""
+    start = time.time()
+    new_count = 0
+
+    for url in RSS_FEEDS:
+        try:
+            res = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; JPMarketLive/1.0)"},
+                timeout=10
+            )
+            items = _parse_rss(res.text, url)
+
+            with get_db() as conn:
+                for item in items:
+                    # 제외 키워드 필터
+                    if any(kw in item["title"] for kw in EXCLUDE_KW):
+                        continue
+                    try:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO news_feed
+                            (uid, title, summary, url, source, published_at,
+                             age_min, stocks, sectors, score)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            item["uid"], item["title"], item["summary"],
+                            item["url"], item["source"],
+                            item["dt"].strftime("%Y-%m-%d %H:%M:%S"),
+                            item["age_min"],
+                            json.dumps(item["stocks"],  ensure_ascii=False),
+                            json.dumps(item["sectors"], ensure_ascii=False),
+                            item["score"],
+                        ))
+                        if conn.execute("SELECT changes()").fetchone()[0]:
+                            new_count += 1
+                    except Exception as e:
+                        log.warning(f"뉴스 DB 저장 오류: {e}")
+                conn.commit()
+        except Exception as e:
+            log.warning(f"RSS 수집 오류 ({url}): {e}")
+
+    elapsed = time.time() - start
+    log.info(f"  [RSS] 신규 {new_count}건 ({elapsed:.1f}초)")
+    return new_count
+
+def _parse_rss(xml_text: str, source: str) -> list:
+    """RSS XML 파싱 (feedparser 우선, ET 폴백)."""
+    now_jst = datetime.now(JST)
+    entries = []
+
+    try:
+        import feedparser
+        feed = feedparser.parse(xml_text)
+        entries = feed.entries
+    except ImportError:
+        import xml.etree.ElementTree as ET
+        xml_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', xml_text)
+        try:
+            root = ET.fromstring(xml_text)
+            ch   = root.find("channel")
+            raw  = ch.findall("item") if ch is not None else []
+        except Exception:
+            return []
+
+        class _FE:
+            def __init__(self, el):
+                self.title     = (el.findtext("title") or "").strip()
+                self.link      = (el.findtext("link")  or "").strip()
+                self.published = (el.findtext("pubDate") or "")
+        entries = [_FE(el) for el in raw]
+
+    items = []
+    for e in entries:
+        title = (getattr(e, "title", "") or "").strip()
+        link  = (getattr(e, "link",  "") or "").strip()
+        pub   = (getattr(e, "published", "") or getattr(e, "updated", "") or "")
+        if not title or not link:
+            continue
+
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(pub).astimezone(JST)
+        except Exception:
+            try:
+                import calendar
+                st = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
+                dt = datetime.fromtimestamp(calendar.timegm(st), tz=JST) if st else now_jst
+            except Exception:
+                dt = now_jst
+
+        uid     = _news_uid(link)
+        age_min = (now_jst - dt).total_seconds() / 60
+        if age_min > 1440 * 30:  # 30일 이상 오래된 뉴스 스킵
+            continue
+
+        matched_stocks  = [c for c, kws in STOCK_KW.items()  if any(k in title for k in kws)]
+        matched_sectors = [s for s, kws in SECTOR_KW.items() if any(k in title for k in kws)]
+        score = _score_news(title, matched_stocks, matched_sectors, age_min)
+
+        summary_raw = (getattr(e, "summary", "") or getattr(e, "description", "") or "").strip()
+        summary = re.sub(r'<[^>]+>', '', summary_raw)[:150].strip()
+        if summary == title:
+            summary = ""
+
+        items.append({
+            "uid": uid, "title": title, "summary": summary,
+            "url": link, "source": source, "dt": dt,
+            "age_min": round(age_min, 1),
+            "stocks": matched_stocks, "sectors": matched_sectors,
+            "score": score,
+        })
+
+    return items
+
+# ─────────────────────────────────────────────────
+# 이벤트 수집 (경제지표 / SQ / 日銀)
+# ─────────────────────────────────────────────────
+
+FINNHUB_KEY = "d7s04mhr01qm28g7t860d7s04mhr01qm28g7t86g"
+
+# 경제지표명 일본어 변환 캐시
+_ev_translate_cache: dict = {}
+
+def _translate_event(text: str) -> str:
+    """경제지표명 → 일본어 변환 (GPT, 캐시 우선)"""
+    if not text:
+        return text
+    if text in _ev_translate_cache:
+        return _ev_translate_cache[text]
+    # 주요 지표 하드코딩 (API 절약)
+    TRANS = {
+        "CPI": "消費者物価指数(CPI)",
+        "Core CPI": "コアCPI",
+        "PPI": "生産者物価指数(PPI)",
+        "GDP": "GDP成長率",
+        "Unemployment Rate": "失業率",
+        "Nonfarm Payrolls": "非農業部門雇用者数",
+        "FOMC": "FOMC政策金利決定",
+        "Fed Interest Rate Decision": "FRB政策金利決定",
+        "BOJ Interest Rate Decision": "日銀政策金利決定",
+        "BOJ Monetary Policy Statement": "日銀金融政策声明",
+        "Industrial Production": "鉱工業生産",
+        "Retail Sales": "小売売上高",
+        "Trade Balance": "貿易収支",
+        "Current Account": "経常収支",
+        "Bank of Japan Interest Rate Decision": "日銀政策金利決定",
+        "Tankan Large Manufacturers Index": "日銀短観(大企業製造業)",
+        "Tokyo CPI": "東京都区部消費者物価指数",
+        "Japan CPI": "全国消費者物価指数",
+    }
+    for en, jp in TRANS.items():
+        if en.lower() in text.lower():
+            _ev_translate_cache[text] = jp
+            return jp
+    _ev_translate_cache[text] = text
+    return text
+
+def _ev_id(date: str, title: str, country: str) -> str:
+    import hashlib as _hl
+    return _hl.md5(f"{date}_{title}_{country}".encode()).hexdigest()[:12]
+
+def _sq_dates(months: int = 3) -> list:
+    """SQ 날짜 자동 계산 (매월 2번째 금요일 전날 = 목요일)"""
+    results = []
+    now = datetime.now(JST)
+    for m in range(months * 2):
+        # 대상 월 계산
+        target = datetime(now.year, now.month, 1, tzinfo=JST) + timedelta(days=32 * m)
+        target = target.replace(day=1)
+        # 해당 월 2번째 금요일 찾기
+        fridays = []
+        d = target
+        while d.month == target.month:
+            if d.weekday() == 4:  # 금요일
+                fridays.append(d)
+            d += timedelta(days=1)
+        if len(fridays) >= 2:
+            sq_fri = fridays[1]  # 2번째 금요일
+            sq_day = sq_fri - timedelta(days=1)  # SQ는 전날 목요일
+            # 메이저SQ: 3,6,9,12월
+            is_major = sq_day.month in [3, 6, 9, 12]
+            results.append({
+                "date": sq_day.strftime("%Y-%m-%d"),
+                "is_major": is_major,
+            })
+    return results
+
+def fetch_events_finnhub() -> int:
+    """Finnhub 경제지표 월간 수집 → events DB 저장"""
+    start = time.time()
+    new_count = 0
+    updated_count = 0
+
+    try:
+        now_jst   = datetime.now(JST)
+        from_date = now_jst.strftime("%Y-%m-%d")
+        to_date   = (now_jst + timedelta(days=35)).strftime("%Y-%m-%d")
+
+        res = requests.get(
+            "https://finnhub.io/api/v1/calendar/economic",
+            params={"from": from_date, "to": to_date, "token": FINNHUB_KEY},
+            timeout=12
+        )
+        events = res.json().get("economicCalendar", [])
+
+        # JP + US, high/medium/low(JP만) 필터
+        filtered = []
+        for e in events:
+            country = e.get("country", "")
+            impact  = e.get("impact", "").lower()
+            if country == "JP":
+                filtered.append(e)  # JP는 전부
+            elif country == "US" and impact in ["high", "medium"]:
+                filtered.append(e)  # US는 high/medium만
+
+        with get_db() as conn:
+            for e in filtered:
+                title   = e.get("event", "").strip()
+                country = e.get("country", "JP")
+                impact  = e.get("impact", "low").lower()
+                raw_time = e.get("time", "")
+
+                # 날짜/시각 파싱
+                try:
+                    dt = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+                    dt_jst    = dt + timedelta(hours=9)
+                    event_date = dt_jst.strftime("%Y-%m-%d")
+                    event_time = dt_jst.strftime("%H:%M")
+                except Exception:
+                    event_date = raw_time[:10] if raw_time else from_date
+                    event_time = "00:00"
+
+                # 중요도 별점
+                stars = 5 if impact == "high" else (3 if impact == "medium" else 1)
+                if country == "JP" and impact == "low":
+                    stars = 2  # JP low는 2점
+
+                title_jp = _translate_event(title)
+                ev_id    = _ev_id(event_date, title, country)
+
+                forecast = str(e["estimate"]) if e.get("estimate") is not None else None
+                previous = str(e["prev"])     if e.get("prev")     is not None else None
+                actual   = str(e["actual"])   if e.get("actual")   is not None else None
+                is_released = 1 if actual is not None else 0
+
+                # 기존 레코드 확인
+                existing = conn.execute(
+                    "SELECT id, actual FROM events WHERE id=?", (ev_id,)
+                ).fetchone()
+
+                if existing is None:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO events
+                            (id, event_date, event_time, country, category,
+                             title, title_jp, stars, forecast, previous, actual,
+                             source, updated_at, is_released)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),?)
+                    """, (ev_id, event_date, event_time, country, "economic",
+                          title, title_jp, stars, forecast, previous, actual,
+                          "finnhub", is_released))
+                    new_count += 1
+                elif actual and existing[1] != actual:
+                    # actual 값이 새로 나왔거나 변경됨 → 업데이트
+                    conn.execute("""
+                        UPDATE events SET
+                            actual=?, is_released=1,
+                            updated_at=datetime('now','localtime')
+                        WHERE id=?
+                    """, (actual, ev_id))
+                    updated_count += 1
+
+            conn.commit()
+
+    except Exception as e:
+        log.warning(f"[이벤트/Finnhub] 수집 오류: {e}")
+
+    elapsed = time.time() - start
+    log.info(f"  [이벤트] Finnhub 신규 {new_count}건 / 업데이트 {updated_count}건 ({elapsed:.1f}초)")
+    return new_count + updated_count
+
+
+def fetch_events_sq() -> int:
+    """SQ 날짜 계산 → events DB 저장"""
+    new_count = 0
+    try:
+        sq_list = _sq_dates(months=3)
+        with get_db() as conn:
+            for sq in sq_list:
+                date     = sq["date"]
+                is_major = sq["is_major"]
+                title    = "メジャーSQ算出日" if is_major else "ミニSQ算出日"
+                title_jp = title
+                stars    = 5 if is_major else 3
+                ev_id    = _ev_id(date, title, "JP")
+
+                existing = conn.execute("SELECT id FROM events WHERE id=?", (ev_id,)).fetchone()
+                if existing is None:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO events
+                            (id, event_date, event_time, country, category,
+                             title, title_jp, stars, source, updated_at, is_released)
+                        VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),?)
+                    """, (ev_id, date, "15:10", "JP", "sq",
+                          title, title_jp, stars, "calculated", 0))
+                    new_count += 1
+            conn.commit()
+    except Exception as e:
+        log.warning(f"[이벤트/SQ] 오류: {e}")
+
+    if new_count:
+        log.info(f"  [이벤트] SQ {new_count}건 추가")
+    return new_count
+
+
+def fetch_events_boj() -> int:
+    """日銀 정책결정회의 일정 수집 (공식 페이지 파싱)"""
+    new_count = 0
+    try:
+        # 일본은행 공식 일정 페이지
+        r = requests.get(
+            "https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2025.htm",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        # 날짜 패턴 파싱 (Jan 23-24, 2025 형태)
+        dates = re.findall(
+            r'(\w+ \d+(?:-\d+)?,\s*\d{4})',
+            r.text
+        )
+        with get_db() as conn:
+            for d in dates[:20]:
+                try:
+                    # "Jan 23-24, 2025" → 마지막 날짜
+                    d_clean = re.sub(r'\d+-(\d+)', r'', d)
+                    dt = datetime.strptime(d_clean.strip(), "%b %d, %Y")
+                    event_date = dt.strftime("%Y-%m-%d")
+                    ev_id = _ev_id(event_date, "日銀政策決定会合", "JP")
+
+                    existing = conn.execute("SELECT id FROM events WHERE id=?", (ev_id,)).fetchone()
+                    if existing is None:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO events
+                                (id, event_date, event_time, country, category,
+                                 title, title_jp, stars, source, updated_at, is_released)
+                            VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),?)
+                        """, (ev_id, event_date, "12:00", "JP", "boj",
+                              "BOJ Interest Rate Decision", "日銀政策決定会合",
+                              5, "boj_official", 0))
+                        new_count += 1
+                except Exception:
+                    continue
+            conn.commit()
+    except Exception as e:
+        log.warning(f"[이벤트/BOJ] 오류: {e}")
+
+    if new_count:
+        log.info(f"  [이벤트] 日銀 {new_count}건 추가")
+    return new_count
+
+
+# 이벤트 수집 주기 관리
+_last_event_fetch: float = 0.0
+EVENT_FETCH_INTERVAL = 1800  # 30분마다
+
+def fetch_events_nikkei225jp() -> int:
+    """
+    nikkei225jp.com/schedule/ #SihyoT 테이블 파싱 → events DB 저장
+    컬럼: 날짜 | 시간 | ★별점 | 지표명 | 結果 | 予想 | 前回
+    필터: JP ★2+, 기타국가 ★4+
+    """
+    import re as _re
+    from bs4 import BeautifulSoup as _BS
+
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://nikkei225jp.com/",
+    }
+    URL = "https://nikkei225jp.com/schedule/"
+
+    # 국기 CSS 클래스 → 국가코드 (실제 클래스: flag1-jp, flag1-us 등)
+    FLAG_MAP = {
+        "flag1-jp": "JP", "flag1-us": "US", "flag1-eu": "EU",
+        "flag1-de": "DE", "flag1-gb": "GB", "flag1-uk": "GB",
+        "flag1-cn": "CN", "flag1-au": "AU", "flag1-kr": "KR",
+        "flag1-fr": "FR", "flag1-ca": "CA", "flag1-in": "IN",
+        "flag1-br": "BR", "flag1-ch": "CH", "flag1-nz": "NZ",
+        "flag1-tr": "TR", "flag1-ru": "RU", "flag1-se": "SE",
+        "flag1-no": "NO", "flag1-pl": "PL",
+    }
+
+    # 비경제 이벤트 필터
+    NON_ECONOMIC_KW = [
+        "FIFA", "ワールドカップ", "開幕", "閉幕", "上場予定",
+        "休日", "休場", "G7サミット", "G20サミット", "サミット開始",
+    ]
+
+    def _is_nonecon(title):
+        for kw in NON_ECONOMIC_KW:
+            if kw in title:
+                return True
+        if "会見" in title:
+            if any(cb in title for cb in ["日銀", "植田", "FRB", "Fed", "ECB", "ラガルド", "BOJ", "ウォーシュ"]):
+                return False
+            return True
+        return False
+
+    def _make_date(date_str):
+        """MM/DD(曜) → YYYY-MM-DD"""
+        m = _re.search(r"(\d{1,2})/(\d{2})", date_str)
+        if not m:
+            return None
+        now_jst = datetime.now(JST)
+        mo, d = int(m.group(1)), int(m.group(2))
+        year = now_jst.year
+        if mo < now_jst.month or (mo == now_jst.month and d < now_jst.day - 1):
+            year += 1
+        return f"{year}-{mo:02d}-{d:02d}"
+
+    def _stars_count(text):
+        """★★★ → 3"""
+        return text.count("★")
+
+    def _passes_filter(country, stars):
+        """DB에는 ★1 이상 전체 저장 (표시 필터는 API/HTML에서 적용)"""
+        return stars >= 1
+
+    new_count = 0
+    updated_count = 0
+
+    try:
+        res = requests.get(URL, headers=HEADERS, timeout=15)
+        res.raise_for_status()
+        soup = _BS(res.text, "html.parser")
+    except Exception as e:
+        log.warning(f"[nikkei225jp] 수집 실패: {e}")
+        return 0
+
+    tbl = soup.find("table", id="SihyoT")
+    if not tbl:
+        log.warning("[nikkei225jp] #SihyoT 테이블 없음")
+        return 0
+
+    now_jst   = datetime.now(JST)
+    today_str = now_jst.strftime("%Y-%m-%d")
+    current_date = None
+
+    with get_db() as conn:
+        for tr in tbl.find_all("tr"):
+            # ── 날짜 헤더 행 ──
+            date_td = tr.find("td", class_="date")
+            if date_td:
+                current_date = _make_date(date_td.get_text(strip=True))
+                continue
+
+            if not current_date:
+                continue
+
+            # 날짜 제한 없음 — 사이트에 있는 전체 기간 저장 (변경시 UPDATE)
+
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+
+            # ── 시간 ──
+            time_td = tr.find("td", class_="time")
+            time_str = time_td.get_text(strip=True) if time_td else "00:00"
+
+            # ── 별점 ──
+            pri_td = tr.find("td", class_="priority")
+            stars = _stars_count(pri_td.get_text()) if pri_td else 0
+
+            # ── 지표명 + 국가 (event td 내 flag1-xx 클래스 스팬) ──
+            event_td = tr.find("td", class_="event")
+            if not event_td:
+                continue
+
+            country = "JP"  # 기본값
+            flag_span = event_td.find("span", class_=True)
+            if flag_span:
+                for cls in flag_span.get("class", []):
+                    if cls in FLAG_MAP:
+                        country = FLAG_MAP[cls]
+                        break
+
+            # 필터: JP ★2+, 기타 ★4+
+            if not _passes_filter(country, stars):
+                continue
+
+            title = event_td.get_text(" ", strip=True).strip()
+            if not title or len(title) < 2:
+                continue
+            if _is_nonecon(title):
+                continue
+
+            # ── 結果/予想/前回 ──
+            result_td     = tr.find("td", class_="result")
+            expect_td     = tr.find("td", class_="expectation")
+            last_td       = tr.find("td", class_="last")
+
+            actual   = result_td.get_text(strip=True)   if result_td   else None
+            forecast = expect_td.get_text(strip=True)   if expect_td   else None
+            previous = last_td.get_text(strip=True)     if last_td     else None
+
+            # 빈 문자열 → None
+            actual   = actual   if actual   else None
+            forecast = forecast if forecast else None
+            previous = previous if previous else None
+
+            is_released = 1 if actual else 0
+
+            ev_id = _ev_id(current_date, title, country)
+
+            existing = conn.execute(
+                "SELECT id, actual, forecast, previous FROM events WHERE id=?",
+                (ev_id,)
+            ).fetchone()
+
+            if existing is None:
+                # 신규 INSERT
+                conn.execute("""
+                    INSERT OR IGNORE INTO events
+                        (id, event_date, event_time, country, category,
+                         title, title_jp, stars, forecast, previous, actual,
+                         source, updated_at, is_released)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),?)
+                """, (ev_id, current_date, time_str, country, "economic",
+                      title, title, stars,
+                      forecast, previous, actual,
+                      "nikkei225jp", is_released))
+                new_count += 1
+            else:
+                # UPSERT — actual/forecast/previous 변경 시만 UPDATE
+                # actual 없는 것이 actual 있는 것을 덮어쓰지 않도록 COALESCE 사용
+                changed = (
+                    (actual   and existing[1] != actual)   or
+                    (forecast and existing[2] != forecast) or
+                    (previous and existing[3] != previous)
+                )
+                if changed:
+                    conn.execute("""
+                        UPDATE events SET
+                            actual   = CASE WHEN ? IS NOT NULL THEN ? ELSE actual END,
+                            forecast = CASE WHEN ? IS NOT NULL THEN ? ELSE forecast END,
+                            previous = CASE WHEN ? IS NOT NULL THEN ? ELSE previous END,
+                            is_released = CASE WHEN ? IS NOT NULL THEN 1 ELSE is_released END,
+                            updated_at  = datetime('now','localtime')
+                        WHERE id = ?
+                    """, (actual, actual, forecast, forecast,
+                          previous, previous, actual, ev_id))
+                    updated_count += 1
+
+        conn.commit()
+
+    log.info(f"  [nikkei225jp] 신규 {new_count}건 / 업데이트 {updated_count}건")
+    return new_count + updated_count
+
+
+def fetch_events_all() -> int:
+    """전체 이벤트 수집 (30분마다)"""
+    global _last_event_fetch
+    now = time.time()
+    if now - _last_event_fetch < EVENT_FETCH_INTERVAL:
+        return 0
+    _last_event_fetch = now
+
+    total = 0
+    # ① nikkei225jp 스크래핑 (메인 소스 — 일본語 지표명, 결과/예상/전회 포함)
+    total += fetch_events_nikkei225jp()
+    # ② Finnhub (보완 소스 — US/EU 지표, forecast/actual 자동 업데이트)
+    total += fetch_events_finnhub()
+    # ③ SQ/BOJ 날짜 자동 계산
+    total += fetch_events_sq()
+    total += fetch_events_boj()
+    return total
+
+
+# ─────────────────────────────────────────────────
+# 카부탄 뉴스 수집 (VPS 직접 스크래핑)
+# ─────────────────────────────────────────────────
+
+KABUTAN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+}
+
+KABUTAN_EXCLUDE = [
+    "野球","サッカー","バスケット","テニス","芸能","タレント","アイドル",
+    "ドラマ","映画","天皇","皇室","交通事故","火災","逮捕","仮想通貨",
+]
+
+KABUTAN_HIGH = [
+    "業績修正","上方修正","下方修正","決算","TOB","買収",
+    "増資","自社株買い","配当修正","社長交代","合併","分割","受注","特許",
+]
+
+KABUTAN_MEDIUM = [
+    "売上","利益","成長","拡大","投資","開発","生産","輸出","輸入","市況","増収","増益",
+]
+
+def _kabutan_importance(title: str) -> int:
+    for kw in KABUTAN_HIGH:
+        if kw in title: return 3
+    for kw in KABUTAN_MEDIUM:
+        if kw in title: return 2
+    return 1
+
+def _kabutan_fetch_page(url: str) -> Optional[str]:
+    try:
+        r = requests.get(url, headers=KABUTAN_HEADERS, timeout=12, allow_redirects=True)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding or "utf-8"
+        return r.text
+    except Exception as e:
+        log.warning(f"[카부탄] fetch 실패 {url[:60]}: {e}")
+        return None
+
+def _kabutan_parse_news(html: str, source: str) -> list:
+    """카부탄 뉴스 목록 HTML에서 뉴스 파싱"""
+    import hashlib as _hl
+    results = []
+    today = datetime.now(JST).strftime("%Y-%m-%d")
+
+    SKIP_TITLES = {"マーケット","株式","ニュース","ランキング","続きを読む","もっと見る","一覧"}
+    seen = set()
+
+    # 패턴1: /news/marketnews/?&b=nXXXXXX 형태 (카부탄 시장뉴스)
+    links1 = re.findall(
+        r'href="(/news/marketnews/\?&b=[^"]+)"[^>]*>([^<]{8,150})',
+        html
+    )
+    for href, title in links1:
+        title = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', title)).strip()
+        # [HH:MM] 시각 태그 제거
+        title = re.sub(r'\s*\[\d{1,2}:\d{2}\]\s*$', '', title).strip()
+        if not title or title in seen or len(title) < 8:
+            continue
+        if any(kw in title for kw in KABUTAN_EXCLUDE):
+            continue
+        seen.add(title)
+        news_id = _hl.md5(f"market_{title}_{today}".encode()).hexdigest()[:12]
+        results.append({
+            "id":         news_id,
+            "code":       "",
+            "company":    "",
+            "title":      title,
+            "url":        f"https://kabutan.jp{href}",
+            "time":       "",
+            "date":       today,
+            "source":     source,
+            "importance": _kabutan_importance(title),
+            "fetched_at": datetime.now(JST).strftime("%Y-%m-%d %H:%M"),
+        })
+
+    # 패턴2: /news/鍑... 형태 (종목뉴스, 결산 등)
+    links2 = re.findall(
+        r'href="(/news/[^"]{10,})"[^>]*>([^<]{8,150})',
+        html
+    )
+    for href, title in links2:
+        # marketnews는 이미 패턴1에서 처리
+        if "marketnews" in href:
+            continue
+        title = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', title)).strip()
+        title = re.sub(r'\s*\[\d{1,2}:\d{2}\]\s*$', '', title).strip()
+        if not title or title in seen or len(title) < 8:
+            continue
+        if title in SKIP_TITLES:
+            continue
+        if any(kw in title for kw in KABUTAN_EXCLUDE):
+            continue
+        seen.add(title)
+
+        code_m = re.search(r'[?&]code=(\d{4}[A-Z]?)', href)
+        code = code_m.group(1) if code_m else ""
+
+        news_id = _hl.md5(f"{code}_{title}_{today}".encode()).hexdigest()[:12]
+        results.append({
+            "id":         news_id,
+            "code":       code,
+            "company":    "",
+            "title":      title,
+            "url":        f"https://kabutan.jp{href}",
+            "time":       "",
+            "date":       today,
+            "source":     source,
+            "importance": _kabutan_importance(title),
+            "fetched_at": datetime.now(JST).strftime("%Y-%m-%d %H:%M"),
+        })
+
+    return results
+
+def fetch_kabutan() -> int:
+    """카부탄 뉴스 수집 → stock_news DB 저장. 신규 건수 반환."""
+    start = time.time()
+    new_count = 0
+    today = datetime.now(JST).strftime("%Y-%m-%d")
+    cutoff_7d = (datetime.now(JST) - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # 수집 URL 목록
+    urls = [
+        ("https://kabutan.jp/news/marketnews/",           "kabutan_market"),
+        ("https://kabutan.jp/news/marketnews/?page=2",    "kabutan_market"),
+        ("https://kabutan.jp/news/marketnews/?page=3",    "kabutan_market"),
+        ("https://kabutan.jp/news/?category=0&page=1",   "kabutan_stock"),
+        ("https://kabutan.jp/news/?category=2&page=1",   "kabutan_stock"),
+        ("https://kabutan.jp/news/?category=3&page=1",   "kabutan_stock"),
+    ]
+
+    all_items = []
+    for url, source in urls:
+        html = _kabutan_fetch_page(url)
+        if html:
+            items = _kabutan_parse_news(html, source)
+            all_items.extend(items)
+        time.sleep(2)  # 카부탄 봇 감지 방지
+
+    # 중복 제거
+    seen_ids = set()
+    unique = []
+    for item in all_items:
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            unique.append(item)
+
+    # DB 저장
+    with get_db() as conn:
+        # 7일 이상 오래된 종목뉴스 자동 삭제
+        conn.execute("DELETE FROM stock_news WHERE date < ?", (cutoff_7d,))
+
+        for item in unique:
+            try:
+                conn.execute("""
+                    INSERT OR IGNORE INTO stock_news
+                        (id, code, company, title, url, time, date,
+                         source, category, importance, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item["id"], item["code"], item["company"],
+                    item["title"], item["url"], item["time"],
+                    item["date"], item["source"], "",
+                    item["importance"], item["fetched_at"],
+                ))
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    new_count += 1
+            except Exception as e:
+                log.warning(f"[카부탄] DB 저장 오류: {e}")
+        conn.commit()
+
+    elapsed = time.time() - start
+    log.info(f"  [카부탄] 신규 {new_count}건 / 총 {len(unique)}건 파싱 ({elapsed:.1f}초)")
+    return new_count
+
+
+# ─────────────────────────────────────────────────
+# TDnet 공시 수집
+# ─────────────────────────────────────────────────
+YANOSHIN_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/today.json"
+
+# ── rank3: 즉시 방송 ──────────────────────────────
+RANK3_KW = [
+    # 결산
+    "決算短信","業績予想","業績修正","四半期報告","通期業績",
+    "売上高修正","営業利益修正","経常利益修正","純利益修正",
+    "上方修正","下方修正",
+    # M&A / 지배구조
+    "TOB","公開買付","株式交換","合併","吸収合併","完全子会社","経営統合",
+    # 자사주
+    "自己株式取得","自社株買い","自己株式の取得",
+    # 대형 이벤트
+    "上場廃止","民事再生","破産","債務超過","事業再生",
+    # 배당
+    "配当予想修正","特別配当","記念配当","配当修正","増配","減配",
+    # 신규상장
+    "新規上場","IPO","上場承認",
+    # 대량보유
+    "大量保有報告書","変更報告書",
+]
+
+# ── rank2: 뉴스탭 표시 ───────────────────────────
+RANK2_KW = [
+    # 제휴 / 투자
+    "業務提携","資本提携","共同開発","戦略的提携",
+    "子会社設立","新会社設立","合弁",
+    # 주식 관련
+    "株式分割","株式併合","増資","公募増資","第三者割当",
+    # 인사
+    "代表取締役","社長交代","役員変更","CEO","会長交代",
+    # 사업
+    "工場建設","新工場","事業譲渡","事業売却","工場閉鎖",
+    "リストラ","希望退職","人員削減","早期退職",
+    # 수주 / 계약
+    "大型受注","受注","契約締結","覚書締結",
+    # 주주우대
+    "株主優待","優待新設","優待変更",
+    # IR
+    "決算発表予定","IR説明会","株主総会",
+]
+
+# ── 제외 키워드 ───────────────────────────────────
+EXCLUDE_DISC_KW = [
+    "コーポレート・ガバナンス報告書","内部統制報告書","確認書",
+    "有価証券届出書","臨時報告書の訂正","訂正有価証券",
+]
+
+# ── 공시 유형 분류 ────────────────────────────────
+def _disc_type(title: str) -> str:
+    if any(k in title for k in ["決算短信","四半期"]):         return "決算短信"
+    if any(k in title for k in ["上方修正","業績修正","下方修正",
+                                  "業績予想","売上高修正"]):    return "業績修正"
+    if "上方修正" in title:                                    return "業績修正▲"
+    if "下方修正" in title:                                    return "業績修正▽"
+    if any(k in title for k in ["TOB","公開買付"]):            return "TOB"
+    if any(k in title for k in ["自己株式","自社株"]):         return "自社株取得"
+    if any(k in title for k in ["合併","経営統合","株式交換"]): return "M&A"
+    if any(k in title for k in ["業務提携","資本提携"]):       return "業務提携"
+    if "株式分割" in title:                                    return "株式分割"
+    if any(k in title for k in ["配当","増配","減配"]):        return "配当"
+    if any(k in title for k in ["代表取締役","社長","役員"]):  return "役員変更"
+    if any(k in title for k in ["増資","公募","第三者割当"]):  return "増資"
+    if any(k in title for k in ["上場廃止","民事再生","破産"]): return "上場廃止"
+    if any(k in title for k in ["新規上場","IPO"]):            return "新規上場"
+    if any(k in title for k in ["受注","契約締結"]):           return "受注"
+    if "株主優待" in title:                                    return "株主優待"
+    if "大量保有" in title:                                    return "大量保有"
+    return "その他"
+
+def _classify_disc(title: str) -> int:
+    if any(kw in title for kw in EXCLUDE_DISC_KW):
+        return 0
+    if any(kw in title for kw in RANK3_KW):
+        return 3
+    if any(kw in title for kw in RANK2_KW):
+        return 2
+    return 1
+
+def fetch_tdnet() -> int:
+    """TDnet 공시 수집 → DB 저장. 신규 건수 반환."""
+    start = time.time()
+    new_count = 0
+    news_mirrored = 0
+
+    try:
+        res = requests.get(
+            YANOSHIN_URL,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=12
+        )
+        data = res.json()
+        items = data if isinstance(data, list) else data.get("items", [])
+
+        now_jst = datetime.now(JST)
+        with get_db() as conn:
+            for item in items:
+                disc_id    = str(item.get("id", "") or item.get("document_id", ""))
+                stock_code = str(item.get("securities_code", "") or "").strip()
+                company    = (item.get("company_name", "") or "").strip()
+                title      = (item.get("title", "") or item.get("document_title", "")).strip()
+                pdf_url    = (item.get("document_url", "") or "").strip()
+                disc_time  = (item.get("time", "") or item.get("document_date_time", "")).strip()
+
+                if not disc_id or not title:
+                    continue
+
+                rank = _classify_disc(title)
+                if rank == 0:
+                    continue
+
+                disc_type = _disc_type(title)
+
+                # 시간 파싱
+                try:
+                    if "T" in disc_time:
+                        dt = datetime.fromisoformat(disc_time).astimezone(JST)
+                    else:
+                        dt = now_jst
+                    disc_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    disc_date = dt.strftime("%Y-%m-%d")
+                    disc_hm   = dt.strftime("%H:%M")
+                except Exception:
+                    disc_at   = now_jst.strftime("%Y-%m-%d %H:%M:%S")
+                    disc_date = now_jst.strftime("%Y-%m-%d")
+                    disc_hm   = now_jst.strftime("%H:%M")
+
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO company_disclosures
+                        (disclosure_id, stock_code, company_name, title,
+                         disclosed_at, rank, pdf_url)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (disc_id, stock_code, company, title, disc_at, rank, pdf_url))
+                    if conn.execute("SELECT changes()").fetchone()[0]:
+                        new_count += 1
+
+                        # rank2 이상 공시 → stock_news에도 미러링
+                        if rank >= 2:
+                            import hashlib as _hl
+                            sn_title = f"【{disc_type}】{company} {title}"
+                            sn_id    = _hl.md5(f"tdnet_{disc_id}".encode()).hexdigest()[:12]
+                            imp      = 3 if rank >= 3 else 2
+                            conn.execute("""
+                                INSERT OR IGNORE INTO stock_news
+                                    (id, code, company, title, url, time, date,
+                                     source, category, importance, fetched_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                sn_id, stock_code, company,
+                                sn_title, pdf_url,
+                                disc_hm, disc_date,
+                                "tdnet", disc_type, imp,
+                                now_jst.strftime("%Y-%m-%d %H:%M"),
+                            ))
+                            if conn.execute("SELECT changes()").fetchone()[0]:
+                                news_mirrored += 1
+
+                except Exception as e:
+                    log.warning(f"공시 DB 저장 오류: {e}")
+            conn.commit()
+
+    except Exception as e:
+        log.warning(f"TDnet 수집 오류: {e}")
+
+    elapsed = time.time() - start
+    log.info(f"  [TDnet] 신규 {new_count}건 (stock_news 미러 {news_mirrored}건) ({elapsed:.1f}초)")
+    return new_count
+
+# ─────────────────────────────────────────────────
+# DB 청소 (30일 이상 오래된 데이터 삭제)
+# ─────────────────────────────────────────────────
+def cleanup_old_data():
+    news_cutoff  = (datetime.now(JST) - timedelta(days=NEWS_RETAIN_DAYS)).strftime("%Y-%m-%d")
+    tdnet_cutoff = (datetime.now(JST) - timedelta(days=TDNET_RETAIN_DAYS)).strftime("%Y-%m-%d")
+    logs_cutoff  = (datetime.now(JST) - timedelta(days=2)).strftime("%Y-%m-%d")
+
+    with get_db() as conn:
+        n1 = conn.execute("DELETE FROM news_feed WHERE published_at < ?", (news_cutoff,)).rowcount
+        n2 = conn.execute("DELETE FROM company_disclosures WHERE disclosed_at < ?", (tdnet_cutoff,)).rowcount
+        n3 = conn.execute("DELETE FROM scheduler_logs WHERE started_at < ?", (logs_cutoff,)).rowcount
+        conn.commit()
+    log.info(f"  [청소] 뉴스 {n1}건, 공시 {n2}건, 로그 {n3}건 삭제")
+
+# ─────────────────────────────────────────────────
+# 백그라운드 수집 루프
+# ─────────────────────────────────────────────────
+_last_cleanup = 0.0
+
+def run_gpt_ranking():
+    """GPT-3.5로 뉴스 중요도 랭킹 처리 (10분마다)"""
+    global _last_gpt_rank_ts, _gpt_rank_cache
+
+    if not OPENAI_API_KEY:
+        return
+    if time.time() - _last_gpt_rank_ts < GPT_RANK_INTERVAL:
+        return
+
+    _last_gpt_rank_ts = time.time()
+
+    try:
+        # 최신 뉴스 20건 가져오기
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT uid, title, source, published_at, stocks, sectors, score
+                FROM news_feed
+                WHERE published_at >= datetime('now', '-24 hours', 'localtime')
+                ORDER BY score DESC, published_at DESC
+                LIMIT 20
+            """).fetchall()
+
+        if not rows:
+            return
+
+        fresh = [dict(r) for r in rows]
+        titles = [f"{i+1}. {n['title']}" for i, n in enumerate(fresh)]
+        news_block = "\n".join(titles)
+
+        # GPT 호출
+        import openai as _oai
+        client_gpt = _oai.OpenAI(api_key=OPENAI_API_KEY)
+        prompt = (
+            f"以下のニュースから【日本株価に直接影響するもの】を厳選し、各ニュースの市場への影響を分析してください。\n\n"
+            f"ニュース:\n{news_block}\n\n"
+            f"分類基準:\n"
+            f"world: FRB金利/米雇用統計/GDP/関税/半導体規制/原油/地政学リスク(株価直撃のみ、最大3件)\n"
+            f"japan: 日銀政策/円相場急変/企業決算/業績修正/TOB/M&A/日本経済指標/適時開示(最大5件)\n"
+            f"❌除外: 政治家発言/外交/スポーツ/芸能/社会事件/株価と無関係な内容\n\n"
+            f"各ニュースに対してimpact(影響先と方向性、20字以内)を付けてください。\n"
+            f"impactは【具体的な銘柄・セクター・指数】と【↑/↓方向】を25字以内で。\n"
+            f"例: '東京エレク↑・半導体全般に買い', 'ドル円↓・輸出株に売り', '銀行株↑・金利上昇期待'\n"
+            f'返答JSON形式: {{"world":[{{"n":1,"impact":"具体的な影響"}}],"japan":[{{"n":2,"impact":"具体的な影響"}}]}}'
+        )
+        res = client_gpt.chat.completions.create(
+            model="gpt-3.5-turbo",
+            max_tokens=150,
+            temperature=0.1,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = res.choices[0].message.content.strip()
+        import re as _re, json as _json
+        raw = _re.sub(r'```json|```', '', raw, flags=_re.IGNORECASE).strip()
+        parsed = _json.loads(raw)
+
+        gpt_world, gpt_japan, ranked_uids = [], [], []
+
+        def _parse_item(item):
+            """{"n":1,"impact":"..."} 또는 숫자 형식 모두 처리"""
+            if isinstance(item, dict):
+                return int(item.get('n', 0)), item.get('impact', '')
+            return int(item), ''
+
+        for item in parsed.get("world", []):
+            num, impact = _parse_item(item)
+            idx = num - 1
+            if 0 <= idx < len(fresh):
+                n = fresh[idx]
+                try:
+                    dt = datetime.strptime(n["published_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+                    time_str = dt.strftime("%H:%M")
+                except Exception:
+                    time_str = "--:--"
+                gpt_world.append({
+                    "uid": n["uid"], "title": n["title"],
+                    "time_str": time_str, "url": "",
+                    "impact": impact or "→ 世界市場", "breaking": idx == 0
+                })
+                ranked_uids.append(n["uid"])
+
+        for item in parsed.get("japan", []):
+            num, impact = _parse_item(item)
+            idx = num - 1
+            if 0 <= idx < len(fresh):
+                n = fresh[idx]
+                try:
+                    dt = datetime.strptime(n["published_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+                    time_str = dt.strftime("%H:%M")
+                except Exception:
+                    time_str = "--:--"
+                gpt_japan.append({
+                    "uid": n["uid"], "title": n["title"],
+                    "time_str": time_str, "url": "",
+                    "impact": impact or "→ 日本株", "breaking": False
+                })
+                ranked_uids.append(n["uid"])
+
+        _gpt_rank_cache = {
+            "world": gpt_world,
+            "japan": gpt_japan,
+            "ranked_uids": ranked_uids,
+            "updated_at": time.time(),
+        }
+        log.info(f"  [GPT 랭킹] world:{len(gpt_world)} japan:{len(gpt_japan)}")
+
+    except Exception as e:
+        log.warning(f"  [GPT 랭킹] 오류: {e}")
+
+
+
+    global _last_cleanup
+    log.info("🚀 수집 루프 시작")
+
+    while True:
+        started = time.time()
+        now_jst = datetime.now(JST)
+
+        try:
+            # 뉴스 수집
+            rss_cnt  = fetch_rss()
+            # 공시 수집 — 24시간 (장 후/심야 공시도 수집)
+            tdnet_cnt = fetch_tdnet()
+
+            # GPT 뉴스 랭킹 (10분마다)
+            run_gpt_ranking()
+
+            # 스케줄러 로그
+            with get_db() as conn:
+                conn.execute("""
+                    INSERT INTO scheduler_logs (job_name, status, count, started_at)
+                    VALUES ('rss+tdnet', 'SUCCESS', ?, ?)
+                """, (rss_cnt + tdnet_cnt, now_jst.strftime("%Y-%m-%d %H:%M:%S")))
+                conn.commit()
+
+        except Exception as e:
+            log.error(f"수집 루프 오류: {e}")
+            with get_db() as conn:
+                conn.execute("""
+                    INSERT INTO scheduler_logs (job_name, status, error_msg, started_at)
+                    VALUES ('rss+tdnet', 'FAIL', ?, ?)
+                """, (str(e), now_jst.strftime("%Y-%m-%d %H:%M:%S")))
+                conn.commit()
+
+        # 매일 새벽 3시 청소
+        if now_jst.hour == 3 and time.time() - _last_cleanup > 3600:
+            cleanup_old_data()
+            _last_cleanup = time.time()
+
+        # 다음 수집까지 대기
+        elapsed = time.time() - started
+        sleep_sec = max(FETCH_INTERVAL - elapsed, 30)
+        time.sleep(sleep_sec)
+
+# ─────────────────────────────────────────────────
+# FastAPI 앱
+# ─────────────────────────────────────────────────
+app = FastAPI(
+    title="JP Market Live — News API",
+    description="24시간 뉴스/공시 수집 서버 (VPS)",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+def _collector_loop():
+    """RSS 뉴스 + 카부탄 + GPT 랭킹 주기적 수집 루프"""
+    import time as _time
+    log.info("✅ 수집 루프 시작")
+    while True:
+        try:
+            fetch_rss()
+        except Exception as e:
+            log.warning(f"fetch_rss 오류: {e}")
+        try:
+            fetch_tdnet()
+        except Exception as e:
+            log.warning(f"fetch_tdnet 오류: {e}")
+        try:
+            fetch_kabutan()
+        except Exception as e:
+            log.warning(f"fetch_kabutan 오류: {e}")
+        try:
+            fetch_events_all()
+        except Exception as e:
+            log.warning(f"fetch_events_all 오류: {e}")
+        try:
+            run_gpt_ranking()
+        except Exception as e:
+            log.warning(f"run_gpt_ranking 오류: {e}")
+        try:
+            cleanup_old_data()
+        except Exception as e:
+            log.warning(f"cleanup 오류: {e}")
+        _time.sleep(300)  # 5분마다
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    # 수집 스레드 시작
+    t = threading.Thread(target=_collector_loop, daemon=True)
+    t.start()
+    log.info("✅ news_server 시작 완료")
+
+# ── API 엔드포인트 ──────────────────────────────
+
+@app.get("/health")
+def health():
+    """서버 상태 확인"""
+    with get_db() as conn:
+        news_cnt  = conn.execute("SELECT COUNT(*) FROM news_feed").fetchone()[0]
+        disc_cnt  = conn.execute("SELECT COUNT(*) FROM company_disclosures").fetchone()[0]
+        sn_cnt    = conn.execute("SELECT COUNT(*) FROM stock_news WHERE date >= date('now','localtime')").fetchone()[0]
+        last_job  = conn.execute(
+            "SELECT status, started_at FROM scheduler_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return {
+        "status":           "ok",
+        "news_count":       news_cnt,
+        "disc_count":       disc_cnt,
+        "stock_news_today": sn_cnt,
+        "last_job":         dict(last_job) if last_job else None,
+        "server_jst":       datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+@app.get("/news")
+def get_news(
+    max_items:   int   = Query(50,  ge=1, le=200),
+    max_age_min: float = Query(1440, ge=1),  # 기본 24시간
+    min_score:   float = Query(0.0, ge=0.0),
+    stock_code:  Optional[str] = Query(None),
+):
+    """
+    최신 뉴스 목록 반환
+    - max_age_min: 최대 나이 (분), 기본 1440 = 24시간
+    - min_score: 최소 중요도 점수 (0.0~1.0)
+    - stock_code: 특정 종목 필터 (예: 6758)
+    """
+    cutoff = (datetime.now(JST) - timedelta(minutes=max_age_min)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db() as conn:
+        if stock_code:
+            rows = conn.execute("""
+                SELECT * FROM news_feed
+                WHERE published_at >= ? AND score >= ?
+                  AND stocks LIKE ?
+                ORDER BY published_at DESC LIMIT ?
+            """, (cutoff, min_score, f'%"{stock_code}"%', max_items)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM news_feed
+                WHERE published_at >= ? AND score >= ?
+                ORDER BY score DESC, published_at DESC LIMIT ?
+            """, (cutoff, min_score, max_items)).fetchall()
+
+    # 주식 무관 뉴스 서버사이드 필터
+    _EXCL = [
+        # 스포츠
+        "ホームラン","マイナーリーグ","五輪","オリンピック","競馬",
+        "ドジャース","レッドソックス","ロッキーズ","カブス","パドレス","ホワイトソックス",
+        # 사건/사고/재해/인물 사망
+        "死亡事故","初公判","検察.*スマホ","脇見運転",
+        "死去", "議長が死","元.*死去","元.*逝去",
+        "クマに襲","クマが","サグラダ","サプリメント",
+        # 정치인 스캔들/동정
+        "中傷動画","ひぼう中傷","秘書.*確信","動静.*年",
+        # 정치 (주식 무관)
+        "再審制度","皇位継承","憲法審査会","公職選挙法",
+        # 기상/재해
+        "激しい雨","落雷","台風","洪水","津波",
+    ]
+    import re as _re
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["stocks"]  = json.loads(d["stocks"]  or "[]")
+        d["sectors"] = json.loads(d["sectors"] or "[]")
+
+        # 제외 키워드 체크
+        title = d.get("title", "")
+        if any(_re.search(kw, title) for kw in _EXCL):
+            continue
+
+        # broadcast.py 호환 필드 추가
+        try:
+            dt = datetime.strptime(d["published_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+            d["time_str"] = dt.strftime("%H:%M")
+            d["age_min"]  = round((datetime.now(JST) - dt).total_seconds() / 60, 1)
+        except Exception:
+            d["time_str"] = "--:--"
+            d["age_min"]  = 999.0
+        result.append(d)
+
+    return {
+        "count": len(result),
+        "items": result,
+        "gpt_world":   _gpt_rank_cache["world"],
+        "gpt_japan":   _gpt_rank_cache["japan"],
+        "gpt_updated": _gpt_rank_cache["updated_at"],
+    }
+
+@app.get("/tdnet")
+def get_tdnet(
+    hours:     float = Query(24.0, ge=0.5),  # 최근 N시간
+    min_rank:  int   = Query(2,    ge=1, le=3),
+    stock_code: Optional[str] = Query(None),
+    unprocessed_only: bool = Query(False),
+):
+    """
+    최신 공시 목록 반환
+    - hours: 최근 N시간 이내 공시
+    - min_rank: 최소 중요도 (2=일반, 3=긴급)
+    - unprocessed_only: 미처리 공시만
+    """
+    cutoff = (datetime.now(JST) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db() as conn:
+        base_q = """
+            SELECT * FROM company_disclosures
+            WHERE disclosed_at >= ? AND rank >= ?
+        """
+        params = [cutoff, min_rank]
+        if stock_code:
+            base_q += " AND stock_code = ?"
+            params.append(stock_code)
+        if unprocessed_only:
+            base_q += " AND is_processed = 0"
+        base_q += " ORDER BY rank DESC, disclosed_at DESC LIMIT 100"
+
+        rows = conn.execute(base_q, params).fetchall()
+
+    return {"count": len(rows), "items": [dict(r) for r in rows]}
+
+@app.post("/tdnet/{disclosure_id}/processed")
+def mark_processed(disclosure_id: str):
+    """공시 처리 완료 표시"""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE company_disclosures SET is_processed=1 WHERE disclosure_id=?",
+            (disclosure_id,)
+        )
+        conn.commit()
+    return {"ok": True}
+
+# ── 최신 상태 캐시 (재접속 시 즉시 전송용) ──────────────────
+_LATEST_CACHE: dict = {}  # type → 최신 데이터 (메모리 캐시)
+
+# 장 종료 후 초기화 대상 (다음날 08:00 JST 초기화)
+_CACHE_DAILY_RESET = {"volume_ranking", "rise_fall_ranking", "sector_stocks", "sector_ranking"}
+# 유지 대상 (장외에도 유효)
+_CACHE_PERSIST = {"news", "news_tab", "schedule", "ticker", "indices"}
+
+def _cache_save_db(data_type: str, payload: dict):
+    """캐시 DB 저장"""
+    try:
+        with get_db() as conn:
+            conn.execute("""
+                INSERT INTO broadcast_cache (data_type, payload, saved_at)
+                VALUES (?, ?, datetime('now','localtime'))
+                ON CONFLICT(data_type) DO UPDATE SET
+                    payload  = excluded.payload,
+                    saved_at = excluded.saved_at
+            """, (data_type, json.dumps(payload, ensure_ascii=False)))
+            conn.commit()
+    except Exception as e:
+        log.warning(f"캐시 DB 저장 오류: {e}")
+
+def _cache_load_db() -> list:
+    """DB에서 캐시 전체 로드 — 다음날 08:00 JST 이후엔 일별 초기화 대상 제외"""
+    try:
+        now_jst = datetime.now(JST)
+        cutoff_str = now_jst.strftime("%Y-%m-%d") + " 08:00:00"
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT data_type, payload, saved_at FROM broadcast_cache"
+            ).fetchall()
+        result = []
+        for row in rows:
+            data_type, payload_str, saved_at = row
+            # 일별 초기화 대상: 오늘 08:00 이전에 저장된 것은 제외
+            if data_type in _CACHE_DAILY_RESET:
+                if saved_at < cutoff_str:
+                    continue
+            try:
+                result.append(json.loads(payload_str))
+            except Exception:
+                pass
+        return result
+    except Exception as e:
+        log.warning(f"캐시 DB 로드 오류: {e}")
+        return []
+
+@app.post("/push/cache")
+def push_cache(payload: dict):
+    """broadcast.py → 최신 데이터 캐시 저장 (메모리 + DB)"""
+    data_type = payload.get("type", "")
+    if data_type and payload:
+        _LATEST_CACHE[data_type] = payload
+        _cache_save_db(data_type, payload)
+    return {"ok": True}
+
+@app.get("/cache")
+def get_cache():
+    """재접속 시 최신 캐시 일괄 반환 (메모리 우선 → DB 폴백)"""
+    if _LATEST_CACHE:
+        return {"ok": True, "items": list(_LATEST_CACHE.values()), "src": "memory"}
+    # 메모리 캐시 없으면 (재시작 후) DB에서 로드
+    db_items = _cache_load_db()
+    # 메모리 캐시에도 복원
+    for item in db_items:
+        dt = item.get("type", "")
+        if dt:
+            _LATEST_CACHE[dt] = item
+    return {"ok": True, "items": db_items, "src": "db"}
+
+@app.get("/stocks")
+def get_stocks():
+    """전체 종목명 목록 반환"""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT code, name, name_short, market, sector FROM stocks ORDER BY code"
+        ).fetchall()
+    return {"count": len(rows), "items": [dict(r) for r in rows]}
+
+
+@app.post("/push/stocks")
+def push_stocks(payload: dict):
+    """
+    broadcast.py / GitHub Actions에서 종목명 업서트
+    payload: {"items": [{"code":"9984","name":"ソフトバンクグループ",...}]}
+    """
+    items = payload.get("items", [])
+    if not items:
+        return {"ok": False, "msg": "empty"}
+
+    upserted = 0
+    with get_db() as conn:
+        for item in items:
+            code = item.get("code", "").strip()
+            name = item.get("name", "").strip()
+            if not code or not name or name == code:
+                continue
+            try:
+                conn.execute("""
+                    INSERT INTO stocks (code, name, name_short, market, sector, updated_at)
+                    VALUES (?,?,?,?,?, datetime('now','localtime'))
+                    ON CONFLICT(code) DO UPDATE SET
+                        name       = excluded.name,
+                        name_short = excluded.name_short,
+                        market     = excluded.market,
+                        sector     = excluded.sector,
+                        updated_at = excluded.updated_at
+                """, (
+                    code,
+                    name,
+                    item.get("name_short", name[:6]),
+                    item.get("market", ""),
+                    item.get("sector", ""),
+                ))
+                upserted += 1
+            except Exception as e:
+                log.warning(f"push_stocks 저장 오류: {e}")
+        conn.commit()
+
+    return {"ok": True, "upserted": upserted, "total": len(items)}
+
+
+@app.post("/push/news")
+def push_news(payload: dict):
+    """
+    GitHub Actions에서 수집한 뉴스를 VPS DB에 저장
+    payload: {"items": [...], "token": "..."}
+    """
+    # 토큰 검증
+    if payload.get("token") != PUSH_TOKEN:
+        return {"ok": False, "msg": "unauthorized"}
+    items = payload.get("items", [])
+    if not items:
+        return {"ok": False, "msg": "empty"}
+
+    saved = 0
+    with get_db() as conn:
+        for item in items:
+            try:
+                conn.execute("""
+                    INSERT OR IGNORE INTO news_feed
+                    (uid, title, summary, url, source, published_at,
+                     age_min, stocks, sectors, score)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    item.get("uid", ""),
+                    item.get("title", ""),
+                    item.get("summary", ""),
+                    item.get("url", ""),
+                    item.get("source", ""),
+                    item.get("published_at", ""),
+                    item.get("age_min", 0),
+                    json.dumps(item.get("stocks", []),  ensure_ascii=False),
+                    json.dumps(item.get("sectors", []), ensure_ascii=False),
+                    item.get("score", 0),
+                ))
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    saved += 1
+            except Exception as e:
+                log.warning(f"push_news 저장 오류: {e}")
+        conn.commit()
+
+    return {"ok": True, "saved": saved, "total": len(items)}
+
+
+@app.get("/api/events")
+def get_events(
+    date_from: Optional[str] = Query(None),   # YYYY-MM-DD (없으면 오늘)
+    date_to:   Optional[str] = Query(None),   # YYYY-MM-DD (없으면 +35일)
+    country:   Optional[str] = Query(None),   # JP / US
+    category:  Optional[str] = Query(None),   # economic / sq / boj
+    min_stars: int           = Query(1, ge=1, le=5),
+    limit:     int           = Query(100, ge=1, le=500),
+):
+    """이벤트 조회 (경제지표 / SQ / 日銀)"""
+    now_jst = datetime.now(JST)
+    if not date_from:
+        date_from = now_jst.strftime("%Y-%m-%d")
+    if not date_to:
+        date_to = (now_jst + timedelta(days=35)).strftime("%Y-%m-%d")
+
+    conditions = ["event_date >= ?", "event_date <= ?", "stars >= ?"]
+    params: list = [date_from, date_to, min_stars]
+
+    if country:
+        conditions.append("country = ?")
+        params.append(country)
+    if category:
+        conditions.append("category = ?")
+        params.append(category)
+
+    where = " AND ".join(conditions)
+    params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(f"""
+            SELECT * FROM events
+            WHERE {where}
+            ORDER BY event_date ASC, event_time ASC, stars DESC
+            LIMIT ?
+        """, params).fetchall()
+
+    return {"ok": True, "count": len(rows), "events": [dict(r) for r in rows]}
+
+
+@app.get("/api/events/today")
+def get_events_today():
+    """오늘 + 내일 + 주말이면 직전 영업일 이벤트 — JP★2+, US★3+, 기타★4+"""
+    now_jst  = datetime.now(JST)
+    today    = now_jst.strftime("%Y-%m-%d")
+    tomorrow = (now_jst + timedelta(days=1)).strftime("%Y-%m-%d")
+    weekday  = now_jst.weekday()
+    if weekday == 5:
+        prev_biz = (now_jst - timedelta(days=1)).strftime("%Y-%m-%d")
+    elif weekday == 6:
+        prev_biz = (now_jst - timedelta(days=2)).strftime("%Y-%m-%d")
+    else:
+        prev_biz = None
+
+    date_list = list({today, tomorrow} | ({prev_biz} if prev_biz else set()))
+    placeholders = ",".join("?" * len(date_list))
+
+    with get_db() as conn:
+        rows = conn.execute(f"""
+            SELECT * FROM events
+            WHERE event_date IN ({placeholders})
+              AND (
+                (country = 'JP' AND stars >= 2) OR
+                (country = 'US' AND stars >= 3) OR
+                (country NOT IN ('JP','US') AND stars >= 4)
               )
-              print(f"VPS 전송: {res.status_code} — {res.text[:100]}")
-          except Exception as e:
-              print(f"VPS 전송 오류: {e}")
-          PYEOF
+            ORDER BY event_date ASC, event_time ASC, stars DESC
+        """, date_list).fetchall()
+
+    events = [dict(r) for r in rows]
+
+    seen = {}
+    for ev in events:
+        key = f"{ev['event_date']}_{ev['event_time']}_{ev.get('title','')}"
+        if key not in seen:
+            seen[key] = ev
+        else:
+            cur = seen[key]
+            if ev.get('actual') and not cur.get('actual'):
+                seen[key] = ev
+
+    deduped = sorted(seen.values(), key=lambda x: (x['event_date'], x['event_time'], -x['stars']))
+
+    filtered = []
+    for ev in deduped:
+        ed = ev["event_date"]
+        et = ev.get("event_time") or "00:00"
+        if ed == today:
+            filtered.append(ev)
+        elif prev_biz and ed == prev_biz and ev.get("actual"):
+            filtered.append(ev)
+        elif ed == tomorrow and et < "09:00":
+            filtered.append(ev)
+
+    return {"ok": True, "count": len(filtered), "events": filtered}
+
+@app.post("/push/events")
+def push_events(payload: dict):
+    """broadcast.py에서 이벤트 실제값(actual) 업데이트 수신"""
+    items = payload.get("events", [])
+    if not items:
+        return {"ok": False, "msg": "empty"}
+
+    updated = 0
+    now_jst = datetime.now(JST)
+    with get_db() as conn:
+        for item in items:
+            ev_id  = item.get("id", "")
+            actual = item.get("actual")
+            if not ev_id or actual is None:
+                continue
+            conn.execute("""
+                UPDATE events SET
+                    actual=?, is_released=1,
+                    updated_at=datetime('now','localtime')
+                WHERE id=?
+            """, (str(actual), ev_id))
+            if conn.execute("SELECT changes()").fetchone()[0]:
+                updated += 1
+        conn.commit()
+
+    log.info(f"[이벤트] actual 업데이트 {updated}건")
+    return {"ok": True, "updated": updated}
+
+
+@app.post("/push/stock_news")
+def push_stock_news(payload: dict):
+    """
+    GitHub Actions collect_stock_news.py → 카부탄 종목뉴스 수신 및 DB 저장
+    payload: {"news": [...], "count": N, "fetched_at": "..."}
+    """
+    news_items = payload.get("news", [])
+    if not isinstance(news_items, list) or not news_items:
+        return {"ok": False, "msg": "empty"}
+
+    inserted = 0
+    skipped  = 0
+
+    today_jst = datetime.now(JST).strftime("%Y-%m-%d")
+    cutoff_7d = (datetime.now(JST) - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    with get_db() as conn:
+        # 7일 이상 오래된 종목뉴스 자동 삭제
+        conn.execute("DELETE FROM stock_news WHERE date < ?", (cutoff_7d,))
+
+        for item in news_items:
+            try:
+                conn.execute("""
+                    INSERT OR IGNORE INTO stock_news
+                        (id, code, company, title, url, time, date,
+                         source, category, importance, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item.get("id", ""),
+                    item.get("code", ""),
+                    item.get("company", ""),
+                    item.get("title", ""),
+                    item.get("url", ""),
+                    item.get("time", ""),
+                    item.get("date", today_jst),
+                    item.get("source", "kabutan_stock"),
+                    item.get("category", ""),
+                    item.get("importance", 1),
+                    item.get("fetched_at", ""),
+                ))
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                log.warning(f"push_stock_news 저장 오류: {e}")
+        conn.commit()
+
+    sources = payload.get("sources", {})
+    log.info(f"[stock_news] 수신 {len(news_items)}건 → 신규 {inserted}건 (시장:{sources.get('market',0)} 종목:{sources.get('stock',0)} 테마:{sources.get('theme',0)})")
+    return {"ok": True, "inserted": inserted, "skipped": skipped, "total": len(news_items)}
+
+
+@app.get("/api/global_quotes")
+def get_global_quotes():
+    """글로벌 지수 Yahoo Finance 프록시 (CORS 우회)"""
+    syms = "^NDX,^GSPC,000001.SS,^NVI,DX-Y.NYB,^VIX"  # ^JTIY는 Yahoo spark 미지원
+    try:
+        res = requests.get(
+            f"https://query2.finance.yahoo.com/v8/finance/spark?symbols={syms}&range=1d&interval=5m",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8
+        )
+        data = res.json() if res.status_code == 200 else {}
+
+        # 일본 국채 10년 별도 조회 (^JTIY)
+        try:
+            r2 = requests.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5EJTIY?interval=5m&range=1d",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8
+            )
+            if r2.status_code == 200:
+                j = r2.json()
+                result = j.get("chart",{}).get("result",[])
+                if result:
+                    closes = [x for x in (result[0].get("indicators",{}).get("quote",[{}])[0].get("close",[]) or []) if x]
+                    prev = result[0].get("meta",{}).get("previousClose",0)
+                    if closes:
+                        data["^JTIY"] = {
+                            "symbol": "^JTIY",
+                            "close": closes,
+                            "previousClose": prev,
+                            "chartPreviousClose": prev
+                        }
+        except Exception:
+            pass
+
+        return data if data else {"error": "no data"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/stock_news")
+def get_stock_news(
+    code:    Optional[str] = Query(None),       # 특정 종목 코드
+    date:    Optional[str] = Query(None),       # YYYY-MM-DD (없으면 오늘)
+    min_imp: int           = Query(1, ge=1, le=3),
+    source:  Optional[str] = Query(None),       # kabutan_stock / kabutan_market / kabutan_theme
+    limit:   int           = Query(50, ge=1, le=200),
+):
+    """종목뉴스 조회 (broadcast.py / HTML 조회용)"""
+    if not date:
+        date = datetime.now(JST).strftime("%Y-%m-%d")
+
+    conditions = ["date >= ?", "importance >= ?"]
+    params: list = [date, min_imp]
+
+    if code:
+        conditions.append("code = ?")
+        params.append(code)
+    if source:
+        conditions.append("source = ?")
+        params.append(source)
+
+    where = " AND ".join(conditions)
+    params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(f"""
+            SELECT * FROM stock_news
+            WHERE {where}
+            ORDER BY importance DESC, date DESC, time DESC
+            LIMIT ?
+        """, params).fetchall()
+
+    return {"ok": True, "count": len(rows), "news": [dict(r) for r in rows]}
+
+
+@app.get("/api/stock_news/codes")
+def get_stock_news_codes(date: Optional[str] = Query(None)):
+    """오늘 뉴스가 있는 종목 코드 목록 + 건수 요약 (해설 대상 종목 선별용)"""
+    if not date:
+        date = datetime.now(JST).strftime("%Y-%m-%d")
+
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT code, company,
+                   COUNT(*) as total,
+                   MAX(importance) as max_imp,
+                   MAX(time) as latest_time
+            FROM stock_news
+            WHERE date >= ? AND code != ''
+            GROUP BY code
+            ORDER BY max_imp DESC, total DESC
+        """, (date,)).fetchall()
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "codes": [
+            {
+                "code":           r[0],
+                "company":        r[1],
+                "count":          r[2],
+                "max_importance": r[3],
+                "latest_time":    r[4],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/push/tdnet")
+def push_tdnet(payload: dict):
+    """
+    broadcast.py에서 수집한 공시를 VPS DB에 저장
+    + news_feed에도 동시 저장 (종목별 뉴스 매칭용)
+    payload: {"items": [...]}
+    """
+    items = payload.get("items", [])
+    if not items:
+        return {"ok": False, "msg": "empty"}
+
+    saved = 0
+    news_saved = 0
+    now_jst = datetime.now(JST)
+
+    with get_db() as conn:
+        for item in items:
+            try:
+                # ① company_disclosures 저장
+                conn.execute("""
+                    INSERT OR IGNORE INTO company_disclosures
+                    (disclosure_id, stock_code, company_name, title,
+                     disclosed_at, rank, pdf_url)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (
+                    item.get("disclosure_id", ""),
+                    item.get("stock_code", ""),
+                    item.get("company_name", ""),
+                    item.get("title", ""),
+                    item.get("disclosed_at", ""),
+                    item.get("rank", 1),
+                    item.get("pdf_url", ""),
+                ))
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    saved += 1
+
+                    # ② rank 2 이상 공시는 news_feed에도 저장 (종목별 뉴스로 활용)
+                    if item.get("rank", 1) >= 2:
+                        import hashlib as _hl
+                        code    = item.get("stock_code", "")
+                        name    = item.get("company_name", "")
+                        title   = item.get("title", "")
+                        disc_id = item.get("disclosure_id", "")
+                        news_uid = _hl.md5(f"tdnet_{disc_id}".encode()).hexdigest()[:12]
+
+                        # score: rank3=0.8, rank2=0.5
+                        score = 0.8 if item.get("rank", 1) >= 3 else 0.5
+
+                        conn.execute("""
+                            INSERT OR IGNORE INTO news_feed
+                            (uid, title, summary, url, source, published_at,
+                             age_min, stocks, sectors, score)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            news_uid,
+                            f"【適時開示】{name} {title}",
+                            f"{name}が{title}を発表しました。",
+                            item.get("pdf_url", ""),
+                            "TDnet/カブタン",
+                            item.get("disclosed_at", now_jst.strftime("%Y-%m-%d %H:%M:%S")),
+                            round((now_jst - datetime.strptime(
+                                item.get("disclosed_at", now_jst.strftime("%Y-%m-%d %H:%M:%S")),
+                                "%Y-%m-%d %H:%M:%S"
+                            ).replace(tzinfo=JST)).total_seconds() / 60, 1) if item.get("disclosed_at") else 0,
+                            json.dumps([code], ensure_ascii=False),
+                            json.dumps([], ensure_ascii=False),
+                            score,
+                        ))
+                        if conn.execute("SELECT changes()").fetchone()[0]:
+                            news_saved += 1
+
+            except Exception as e:
+                log.warning(f"push_tdnet 저장 오류: {e}")
+        conn.commit()
+
+    return {"ok": True, "saved": saved, "news_saved": news_saved, "total": len(items)}
+
+
+
+    """수집 통계"""
+    with get_db() as conn:
+        news_today = conn.execute(
+            "SELECT COUNT(*) FROM news_feed WHERE DATE(published_at) = DATE('now','localtime')"
+        ).fetchone()[0]
+        disc_today = conn.execute(
+            "SELECT COUNT(*) FROM company_disclosures WHERE DATE(disclosed_at) = DATE('now','localtime')"
+        ).fetchone()[0]
+        recent_logs = conn.execute(
+            "SELECT job_name, status, count, started_at FROM scheduler_logs ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+    return {
+        "news_today":  news_today,
+        "disc_today":  disc_today,
+        "recent_logs": [dict(r) for r in recent_logs],
+    }
+
+# ─────────────────────────────────────────────────
+# 직접 실행
+# ─────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("news_server:app", host="0.0.0.0", port=8900, reload=False)
