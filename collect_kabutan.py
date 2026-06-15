@@ -12,11 +12,21 @@ VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "")
 VPS_TOKEN   = os.environ.get("VPS_TOKEN", "")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-    "Accept-Language": "ja,en-US;q=0.9",
-    "Referer": "https://kabutan.jp/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
 }
+
+# 세션 사용 (쿠키 유지)
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 # ── 카부탄 수집 URL ────────────────────────────────
 KABUTAN_URLS = {
@@ -53,7 +63,7 @@ def classify_importance(title: str) -> int:
 def fetch_news_market() -> list:
     """카부탄 마켓 속보 뉴스 수집"""
     try:
-        r = requests.get(KABUTAN_URLS["news_market"], headers=HEADERS, timeout=15)
+        r = SESSION.get(KABUTAN_URLS["news_market"], timeout=15)
         if r.status_code != 200:
             print(f"  [카부탄뉴스] HTTP {r.status_code}")
             return []
@@ -124,7 +134,7 @@ def fetch_news_market() -> list:
 def fetch_rating() -> list:
     """애널리스트 레이팅/목표주가 변경 수집"""
     try:
-        r = requests.get(KABUTAN_URLS["rating"], headers=HEADERS, timeout=15)
+        r = SESSION.get(KABUTAN_URLS["rating"], timeout=15)
         if r.status_code != 200:
             return []
         html = r.text
@@ -172,7 +182,7 @@ def fetch_stop_stocks() -> list:
     for category, url in [("stop_high", KABUTAN_URLS["stop_high"]),
                            ("stop_low",  KABUTAN_URLS["stop_low"])]:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = SESSION.get(url, timeout=15)
             if r.status_code != 200:
                 continue
             html = r.text
@@ -232,8 +242,11 @@ def main():
 
     all_items = []
 
-    # 1. 마켓 속보 뉴스
+    # 1. 마켓 속보 뉴스 (카부탄 → 민카부 폴백)
     news = fetch_news_market()
+    if not news:
+        print("  카부탄 실패 → 민카부 시도")
+        news = fetch_minkabu_news()
     all_items.extend(news)
     time.sleep(2)
 
@@ -253,3 +266,53 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def fetch_minkabu_news() -> list:
+    """민카부 속보 뉴스 수집 (카부탄 폴백)"""
+    try:
+        url = "https://minkabu.jp/news/stock"
+        r = SESSION.get(url, timeout=15)
+        if r.status_code != 200:
+            print(f"  [민카부] HTTP {r.status_code}")
+            return []
+        html = r.text
+        items = []
+        today = datetime.now(JST).strftime("%Y-%m-%d")
+        now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+        # 민카부 뉴스 파싱
+        rows = re.findall(
+            r'<a[^>]+href="/news/(\d+)"[^>]*>([^<]{5,100})</a>.*?'
+            r'(?:(\d{2}:\d{2}))?',
+            html, re.DOTALL
+        )
+        # 종목 코드 패턴
+        code_rows = re.findall(
+            r'/stock/(\d{4}[A-Z]?)[^"]*"[^>]*>.*?'
+            r'<a[^>]+href="/news/\d+"[^>]*>([^<]{5,100})</a>',
+            html, re.DOTALL
+        )
+
+        for code, title in code_rows[:30]:
+            title = title.strip()
+            imp = classify_importance(title)
+            if imp < 2:
+                continue
+            uid = hashlib.md5(f"minka_{today}_{code}_{title}".encode()).hexdigest()[:12]
+            items.append({
+                "uid":          uid,
+                "title":        f"[{code}] {title}",
+                "summary":      "",
+                "url":          f"https://minkabu.jp/stock/{code}/news",
+                "source":       "minkabu_news",
+                "published_at": now_str,
+                "stocks":       f'["{code}"]',
+                "importance":   imp,
+            })
+
+        print(f"  [민카부] {len(items)}건")
+        return items
+    except Exception as e:
+        print(f"  [민카부] 오류: {e}")
+        return []
