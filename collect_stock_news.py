@@ -5,14 +5,15 @@ collect_stock_news.py
 GitHub Actions에서 실행 (5분마다)
 카부탄 뉴스 수집 → VPS /push/stock_news 전송
 
-전략 (요청 최소화):
-  1. 카부탄 시장뉴스 목록 페이지 (10~15페이지) → 종목코드 파싱
-  2. 카부탄 전체뉴스 목록 (페이지 순회) → 종목코드 파싱
-  → 종목별 개별 요청 없이 대량 수집
+수정사항 v2:
+- VPS 세션 오염 문제 수정 (get_top_codes 실패 시 세션 재생성)
+- 카부탄 봇차단 우회: User-Agent 로테이션 + 요청 간격 랜덤화
+- VPS 전송 재시도 로직 추가 (3회)
+- 에러 로그 상세화
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import os, re, sys, json, time, hashlib, urllib.request
+import os, re, sys, json, time, hashlib, random, urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
@@ -27,20 +28,30 @@ VPS_URL    = os.environ.get("VPS_URL", "https://jpstocklive.com")
 VPS_SECRET = os.environ.get("VPS_SECRET", "")
 JST = timezone(timedelta(hours=9))
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
+# ★ User-Agent 로테이션 (카부탄 봇차단 우회)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
 
-# 닛케이225 전종목 (파싱된 뉴스의 종목코드 필터링용)
+def _get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Cache-Control": "max-age=0",
+    }
+
+# 닛케이225 전종목
 NK225_CODES = set([
     "1332","1333","1605","1721","1801","1802","1803","1808","1812","1925",
     "1928","1963","2002","2269","2282","2413","2432","2501","2502","2503",
@@ -87,9 +98,7 @@ _MEDIUM_IMPACT = [
     "輸出","輸入","価格","需要","供給","市況","増収","増益",
 ]
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 유틸리티
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── 유틸리티 ─────────────────────────────────────────────
 
 def _clean(s: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', s)).strip()
@@ -113,86 +122,59 @@ def _classify(title: str) -> int:
 def _excluded(title: str) -> bool:
     return any(kw in title for kw in _EXCLUDE_KEYWORDS)
 
-_session = None
-def _sess():
-    global _session
-    if _session is None:
-        if HAS_REQUESTS:
-            _session = requests.Session()
-            _session.headers.update(HEADERS)
-        else:
-            _session = False
-    return _session
-
-def _fetch(url: str, timeout: int = 12) -> Optional[str]:
-    s = _sess()
-    if s:
+def _fetch(url: str, timeout: int = 15, retry: int = 2) -> Optional[str]:
+    """★ 헤더 매번 새로 생성 + 재시도"""
+    for attempt in range(retry + 1):
         try:
-            r = s.get(url, timeout=timeout, allow_redirects=True)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding or "utf-8"
-            return r.text
+            if HAS_REQUESTS:
+                r = requests.get(url, headers=_get_headers(), timeout=timeout, allow_redirects=True)
+                if r.status_code == 405:
+                    print(f"  [fetch 405] {url[:60]} — 잠시 대기 후 재시도")
+                    time.sleep(random.uniform(5, 10))
+                    continue
+                r.raise_for_status()
+                r.encoding = r.apparent_encoding or "utf-8"
+                return r.text
+            else:
+                req = urllib.request.Request(url, headers=_get_headers())
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.read().decode("utf-8", errors="ignore")
         except Exception as e:
-            print(f"  [fetch 실패] {url[:70]}: {e}")
-            return None
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"  [fetch 실패] {url[:70]}: {e}")
-        return None
+            if attempt < retry:
+                wait = random.uniform(3, 7)
+                print(f"  [fetch 실패 {attempt+1}/{retry}] {url[:60]}: {e} — {wait:.1f}초 후 재시도")
+                time.sleep(wait)
+            else:
+                print(f"  [fetch 최종 실패] {url[:60]}: {e}")
+    return None
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 핵심: 카부탄 뉴스 목록 페이지 파싱
-# 한 페이지에서 종목코드 + 뉴스제목을 한꺼번에 추출
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── 카부탄 파싱 ───────────────────────────────────────────
 
 def _parse_news_list(html: str, source: str) -> List[dict]:
-    """
-    카부탄 뉴스 목록 HTML에서 뉴스 파싱
-    URL 패턴: /news/marketnews/?&b=nXXXXXXXX (시장뉴스)
-              /stock/news/?code=XXXX (종목뉴스 링크)
-    """
     results = []
     today = _today()
 
-    # ── 방법1: 뉴스 목록 테이블 행 파싱 ──
-    # 구조: <tr> <td>시각</td> <td><a href="/news/...">제목</a></td> <td>종목코드</td>
-    rows = re.findall(
-        r'<tr[^>]*>.*?</tr>',
-        html, re.DOTALL
-    )
-
+    rows = re.findall(r'<tr[^>]*>.*?</tr>', html, re.DOTALL)
     for row in rows:
-        # 제목과 링크 추출
         title_m = re.search(
-            r'href="(/news/[^"]+)"[^>]*>\s*([^<]{5,120})\s*</a>',
-            row
-        )
+            r'href="(/news/[^"]+)"[^>]*>\s*([^<]{5,120})\s*</a>', row)
         if not title_m:
             continue
         href, title = title_m.group(1), _clean(title_m.group(2))
         if not title or len(title) < 5 or _excluded(title):
             continue
 
-        # 시각 추출
         time_m = re.search(r'(\d{1,2}:\d{2})', row)
         time_str = time_m.group(1) if time_m else ""
 
-        # 종목코드 추출 (행 안의 /stock/ 링크에서)
         code_m = re.search(r'/stock/[^/]+/\?code=(\d{4}[A-Z]?)', row)
         code = code_m.group(1) if code_m else ""
-
-        # 뉴스 URL에서도 종목코드 추출 시도
         if not code:
             code_m2 = re.search(r'[?&]code=(\d{4}[A-Z]?)', href)
             code = code_m2.group(1) if code_m2 else ""
 
-        news_id = _make_id(code or "market", title, today)
         results.append({
-            "id":         news_id,
+            "id":         _make_id(code or "market", title, today),
             "code":       code,
             "company":    "",
             "title":      title,
@@ -204,26 +186,20 @@ def _parse_news_list(html: str, source: str) -> List[dict]:
             "fetched_at": _jst_now(),
         })
 
-    # ── 방법2: 단순 링크+제목 추출 (방법1 결과가 적을 때) ──
     if len(results) < 5:
         results = []
         links = re.findall(
-            r'href="(/news/[^"?]{10,})"[^>]*>\s*([^<]{8,120})\s*</a>',
-            html
-        )
+            r'href="(/news/[^"?]{10,})"[^>]*>\s*([^<]{8,120})\s*</a>', html)
         seen = set()
         for href, title in links:
             title = _clean(title)
             if not title or title in seen or _excluded(title) or len(title) < 8:
                 continue
-            # 너무 짧거나 메뉴 항목 같은 것 제외
-            if title in ["マーケット", "株式", "ニュース", "ランキング", "続きを読む"]:
+            if title in ["マーケット","株式","ニュース","ランキング","続きを読む"]:
                 continue
             seen.add(title)
-
             code_m = re.search(r'[?&]code=(\d{4}[A-Z]?)', href)
             code = code_m.group(1) if code_m else ""
-
             results.append({
                 "id":         _make_id(code or "market", title, today),
                 "code":       code,
@@ -236,20 +212,9 @@ def _parse_news_list(html: str, source: str) -> List[dict]:
                 "importance": _classify(title),
                 "fetched_at": _jst_now(),
             })
-
     return results
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1. 카부탄 시장뉴스 목록 (페이지 순회)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def fetch_market_news_pages(max_pages: int = 15) -> List[dict]:
-    """
-    카부탄 시장뉴스 목록을 페이지 순회하며 수집
-    https://kabutan.jp/news/marketnews/?page=N
-    → 1페이지 약 20건, 15페이지 = 최대 300건
-    """
     print(f"[카부탄] 시장뉴스 목록 수집 중... (최대 {max_pages}페이지)")
     all_items = []
     seen_ids = set()
@@ -258,7 +223,7 @@ def fetch_market_news_pages(max_pages: int = 15) -> List[dict]:
         url = f"https://kabutan.jp/news/marketnews/?page={page}"
         html = _fetch(url)
         if not html:
-            print(f"  페이지 {page}: 실패")
+            print(f"  페이지 {page}: 실패 — 중단")
             break
 
         items = _parse_news_list(html, "kabutan_market")
@@ -266,36 +231,22 @@ def fetch_market_news_pages(max_pages: int = 15) -> List[dict]:
         for x in new:
             seen_ids.add(x["id"])
         all_items.extend(new)
-
         print(f"  페이지 {page}: {len(new)}건 (누계 {len(all_items)}건)")
 
-        # 마지막 페이지 감지 (결과 없으면 종료)
         if len(items) == 0:
             break
 
-        # 요청 간격 (카부탄 봇 감지 방지)
-        time.sleep(2)
+        # ★ 랜덤 대기 (봇차단 우회)
+        time.sleep(random.uniform(2, 4))
 
     print(f"  → 시장뉴스 합계 {len(all_items)}건")
     return all_items
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 2. 카부탄 종목별 뉴스 목록 (카테고리별 페이지)
-#    개별 종목 페이지 요청 없이 전체 목록에서 파싱
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def fetch_stock_news_pages(max_pages: int = 10) -> List[dict]:
-    """
-    카부탄 종목뉴스 카테고리 목록 수집
-    https://kabutan.jp/news/?category=0&page=N
-    → 종목 관련 전체 뉴스 (결산, 業績修正 등 포함)
-    """
+def fetch_stock_news_pages(max_pages: int = 5) -> List[dict]:
     print(f"[카부탄] 종목뉴스 목록 수집 중... (최대 {max_pages}페이지)")
     all_items = []
     seen_ids = set()
 
-    # 카테고리별 수집
     categories = [
         ("0",  "결산/업적"),
         ("2",  "M&A/TOB"),
@@ -313,12 +264,10 @@ def fetch_stock_news_pages(max_pages: int = 10) -> List[dict]:
                 break
 
             items = _parse_news_list(html, "kabutan_stock")
-            # NK225 종목 관련 뉴스만 (또는 종목코드 없는 것도 포함)
             filtered = []
             for x in items:
                 if x["id"] in seen_ids:
                     continue
-                # 종목코드 있으면 NK225 여부 확인 (없으면 포함)
                 if x["code"] and x["code"] not in NK225_CODES:
                     continue
                 seen_ids.add(x["id"])
@@ -330,23 +279,27 @@ def fetch_stock_news_pages(max_pages: int = 10) -> List[dict]:
 
             if len(items) == 0:
                 break
-            time.sleep(2)
+            time.sleep(random.uniform(2, 4))
 
         print(f"  [{cat_name}]: {cat_count}건")
 
     print(f"  → 종목뉴스 합계 {len(all_items)}건")
     return all_items
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3. VPS 캐시에서 거래대금 상위 종목 가져오기 (보조)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── VPS 연동 ──────────────────────────────────────────────
 
 def get_top_codes_from_vps() -> List[str]:
+    """★ 세션 오염 방지: 독립 requests 호출"""
     try:
-        s = _sess()
-        url = f"{VPS_URL}/cache"
-        data = s.get(url, timeout=8).json() if s else json.loads(_fetch(url) or "{}")
+        r = requests.get(
+            f"{VPS_URL}/cache",
+            headers=_get_headers(),
+            timeout=8
+        )
+        if r.status_code != 200:
+            print(f"[VPS] 캐시 조회 HTTP {r.status_code}")
+            return []
+        data = r.json()
         for item in data.get("items", []):
             if item.get("type") == "volume_ranking":
                 codes = [str(x["code"]) for x in item.get("items", []) if x.get("code")]
@@ -357,12 +310,8 @@ def get_top_codes_from_vps() -> List[str]:
         print(f"[VPS] 캐시 조회 실패: {e}")
     return []
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4. VPS 전송
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def push_to_vps(news_items: List[dict]) -> bool:
+def push_to_vps(news_items: List[dict], max_retry: int = 3) -> bool:
+    """★ 재시도 3회 + 상세 에러 로그"""
     if not news_items:
         print("[VPS] 전송할 뉴스 없음")
         return True
@@ -378,47 +327,59 @@ def push_to_vps(news_items: List[dict]) -> bool:
             "stock":  len([n for n in news_items if n["source"] == "kabutan_stock"]),
         }
     }
-    s = _sess()
-    try:
-        if s:
-            r = s.post(url, json=payload, timeout=15)
+
+    print(f"[VPS] 전송 시도: {url} ({len(news_items)}건)")
+
+    for attempt in range(1, max_retry + 1):
+        try:
+            r = requests.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "JPStock-Collector/2.0"},
+                timeout=30
+            )
+            print(f"[VPS] HTTP {r.status_code} | 응답: {r.text[:200]}")
             r.raise_for_status()
-            print(f"[VPS] 전송 완료: {r.json()}")
-        else:
-            data = json.dumps(payload, ensure_ascii=False).encode()
-            req = urllib.request.Request(url, data=data,
-                headers={**HEADERS, "Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                print(f"[VPS] 전송 완료: {json.loads(r.read().decode())}")
-        return True
-    except Exception as e:
-        print(f"[VPS] 전송 실패: {e}")
-        return False
+            result = r.json()
+            print(f"[VPS] ✅ 전송 완료: {result}")
+            return True
+        except requests.exceptions.JSONDecodeError as e:
+            print(f"[VPS] JSON 파싱 실패 ({attempt}/{max_retry}): {e}")
+            print(f"[VPS] 응답 내용: {r.text[:300] if 'r' in dir() else 'N/A'}")
+        except requests.exceptions.Timeout:
+            print(f"[VPS] 타임아웃 ({attempt}/{max_retry})")
+        except requests.exceptions.ConnectionError as e:
+            print(f"[VPS] 연결 오류 ({attempt}/{max_retry}): {e}")
+        except Exception as e:
+            print(f"[VPS] 기타 오류 ({attempt}/{max_retry}): {type(e).__name__}: {e}")
 
+        if attempt < max_retry:
+            wait = attempt * 5
+            print(f"[VPS] {wait}초 후 재시도...")
+            time.sleep(wait)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 메인
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print(f"[VPS] ❌ {max_retry}회 모두 실패")
+    return False
+
+# ── 메인 ─────────────────────────────────────────────────
 
 def main():
     start = time.time()
     now_jst = datetime.now(JST)
     print(f"━━━ 카부탄 뉴스 수집 시작 {now_jst.strftime('%Y-%m-%d %H:%M JST')} ━━━")
     print(f"requests: {'✅' if HAS_REQUESTS else '❌ urllib 폴백'}")
+    print(f"VPS_URL: {VPS_URL}")
 
-    # VPS에서 거래대금 상위 종목 확인 (NK225에 추가)
+    # VPS 거래대금 상위 종목 추가
     top_codes = get_top_codes_from_vps()
     if top_codes:
         NK225_CODES.update(top_codes)
         print(f"  → 감시 종목 총 {len(NK225_CODES)}개")
 
     all_news = []
-
-    # 1. 시장뉴스 목록 (15페이지)
     market_news = fetch_market_news_pages(max_pages=15)
     all_news.extend(market_news)
 
-    # 2. 종목뉴스 카테고리 목록
     stock_news = fetch_stock_news_pages(max_pages=5)
     all_news.extend(stock_news)
 
