@@ -1,15 +1,15 @@
 """
 collect_news.py
-GitHub Actions에서 실행 — NHK/Reuters/Bloomberg RSS 수집 → VPS push
+GitHub Actions에서 실행 — NHK/CNBC/Yahoo RSS 수집 → VPS push
 평일/주말 관계없이 5분마다 실행
 
-변경사항:
-- yahoo_fin/yahoo_it/yahoo_biz 제거 (자동차/생활 잡뉴스 주 소스)
-- reuters_jp/bloomberg_jp 추가 (GitHub Actions IP는 차단 안됨)
-- EXCLUDE_KW 대폭 강화 (자동차/생활/사건사고 등)
-- HIGH_KW 강화 (일본주식 직접 영향 키워드)
+v3 변경사항:
+- Reuters/Bloomberg 제거 (GitHub Actions IP 차단)
+- CNBC Asia/World/Finance 추가 (미국장/글로벌 거시)
+- HIGH_KW/MEDIUM_KW 영어 키워드 추가 (CNBC용)
+- EXCLUDE_KW 대폭 강화
 """
-import os, re, time, hashlib, json
+import os, re, time, hashlib
 from datetime import datetime, timezone, timedelta
 import requests
 import xml.etree.ElementTree as ET
@@ -25,15 +25,16 @@ HEADERS = {
 }
 
 RSS_FEEDS = [
-    # NHK 경제/금융 특화
-    ("nhk_biz",    "https://www.nhk.or.jp/rss/news/cat5.xml"),  # 경제/기업
-    ("nhk_world",  "https://www.nhk.or.jp/rss/news/cat4.xml"),  # 국제경제
-    ("nhk_eco",    "https://www.nhk.or.jp/rss/news/cat6.xml"),  # 과학/기술
-    # 금융 전문 (GitHub Actions IP는 차단 안됨)
-    ("reuters_jp", "https://feeds.reuters.com/reuters/JPBusinessNews"),
-    ("reuters_en", "https://feeds.reuters.com/reuters/businessNews"),
-    ("bloomberg",  "https://www.bloomberg.co.jp/feeds/bpol/news"),
-    # Yahoo Finance JP (비즈니스 카테고리 — 잡뉴스 많지만 필터링 적용)
+    # ── NHK (안정적, 일본 경제/지정학) ──────────────────
+    ("nhk_biz",    "https://www.nhk.or.jp/rss/news/cat5.xml"),    # 경제/기업
+    ("nhk_world",  "https://www.nhk.or.jp/rss/news/cat4.xml"),    # 국제경제
+    ("nhk_eco",    "https://www.nhk.or.jp/rss/news/cat6.xml"),    # 과학/기술
+    # ── CNBC (미국장/글로벌 거시 — GitHub Actions 접근 가능) ──
+    ("cnbc_asia",  "https://www.cnbc.com/id/20910258/device/rss/rss.html"),   # Asia Pacific
+    ("cnbc_world", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),  # World News
+    ("cnbc_fin",   "https://www.cnbc.com/id/10000664/device/rss/rss.html"),   # Finance
+    ("cnbc_earn",  "https://www.cnbc.com/id/15839069/device/rss/rss.html"),   # Earnings
+    # ── Yahoo Finance JP (필터링 강화) ───────────────────
     ("yahoo_fin",  "https://news.yahoo.co.jp/rss/categories/business.xml"),
 ]
 
@@ -50,16 +51,17 @@ EXCLUDE_KW = [
     "芸能","アイドル","歌手","俳優","映画","ドラマ","コンサート",
     "音楽","エンタメ","バラエティ","漫画","アニメ","タレント",
     # 자동차/이동수단 (주식 무관 기사)
-    "ベストカー","MotorFan","carview","乗りものニュース","Auto Messe",
+    "MotorFan","carview","乗りものニュース","Auto Messe","Aviation Wire",
+    "ベストカーWeb","バイクのニュース","ライフハッカー","VAGUE",
     "ノートオーラ","アルファード","ハイラックス","N-BOX","ロードスター",
     "エアロ","カスタム","バイク","二輪","アウトバーン","レンタカー",
-    "夜行バス","航空機","エアフォース","エティハド","Aviation Wire",
+    "夜行バス","エアフォース","エティハド",
     # 생활/취미
     "グルメ","食べ歩き","観光","旅行","温泉","スイーツ","ビリヤニ",
-    "ラーメン","そば","うどん","料理","レシピ","カフェ",
+    "ラーメン","そば","うどん","料理","レシピ","カフェ","寿司",
     "日焼け","スキンケア","美容","ダイエット","健康食品","天然パーマ",
     "時計","スマホ","Android","Wi-Fi","ガジェット",
-    "ドローン","測量","3D","VR","ゲーム","キャラ",
+    "ドローン","測量","ゲーム","キャラ","クレーンゲーム",
     # 사건사고 (주식 무관)
     "交通事故","火災","逮捕","容疑者","殺人","詐欺被害","窃盗","強盗",
     "行方不明","死亡事故","遺体","列車衝突","落下","衝突事故",
@@ -67,49 +69,68 @@ EXCLUDE_KW = [
     # 황실/정치 (경제 무관)
     "天皇","皇后","皇室","陛下","皇太子","皇族","両陛下",
     "慰霊","追悼","記念式典","表敬訪問","植樹",
-    "立民","公明","維新","参院","衆院","委員会",
+    "立民","公明","維新","参院","衆院",
     "沖縄","糸満","博物館","ハラスメント","弁護士相談",
-    # 잡지/미디어 소스명 (제목에 포함된 경우)
+    # 잡지/미디어 소스명
     "ダイヤモンド・オンライン","東洋経済オンライン","プレジデント",
-    "Merkmal","LIMO","Finasee","WEB CARTOP","MotorFan","carview",
-    "ベストカーWeb","乗りものニュース","Auto Messe","Aviation Wire",
-    "バイクのニュース","ライフハッカー","VAGUE",
-    # 취업/교육
-    "売り手市場","就職","ハロワ","ハローワーク","採用","転職","求人",
-    "奨学金","入試","受験","大学院",
+    "Merkmal","LIMO","Finasee","WEB CARTOP",
     # 기타 무관
-    "ナビスコ","ギフティ","フリマ","メルカリ","ヤフオク",
-    "クレーンゲーム","ガチャ","パチンコ","競馬","宝くじ",
+    "フリマ","メルカリ","ヤフオク","相続","口座凍結",
+    "アウトドア","キャンプ","登山","釣り","ペット","犬","猫",
+    "住宅ローン","繰り上げ返済","ライフハック","ナビスコ","IBM",
+    "売り手市場","就職","ハロワ","ハローワーク","採用","転職","求人",
+    "奨学金","入試","受験","定時制","通信制",
+    "パチンコ","競馬","宝くじ","ガチャ",
 ]
 
-# ★ 고중요도 키워드 (일본주식 직접 영향)
+# ★ 고중요도 키워드 (일본주식 직접 영향) — 일본어 + 영어
 HIGH_KW = [
-    # 금융정책
+    # 금융정책 (일본어)
     "日銀","BOJ","金利","FOMC","FRB","利上げ","利下げ","量的緩和",
     "政策金利","マイナス金利","為替介入",
-    # 경제지표
+    # 경제지표 (일본어)
     "GDP","CPI","PCE","雇用統計","インフレ","デフレ","景気後退",
     "貿易収支","経常収支","消費者物価",
-    # 기업 이벤트
+    # 기업 이벤트 (일본어)
     "決算","業績修正","上方修正","下方修正","TOB","買収","合併",
     "上場廃止","破産","民事再生","増資","自社株買い","配当修正",
-    "社長交代","CEO","リストラ","希望退職","早期退職",
-    # 시장
+    "社長交代","リストラ","希望退職","早期退職",
+    # 시장 (일본어)
     "日経平均","TOPIX","円高","円安","円相場","ドル円","株価急落","急騰",
     "半導体","AI投資","データセンター","関税","輸出規制","制裁",
     "原油","WTI","天然ガス","金価格","銅価格",
-    # 지정학
-    "ホルムズ","台湾有事","地政学","安全保障","防衛費",
+    # 지정학 (일본어)
+    "ホルムズ","台湾","地政学","安全保障","防衛費",
+    # ── 영어 키워드 (CNBC용) ──────────────────────────
+    "Bank of Japan","interest rate","Federal Reserve","Fed rate",
+    "rate hike","rate cut","inflation","CPI","jobs report","employment",
+    "Nikkei","yen","USD/JPY","dollar yen","forex",
+    "semiconductor","chip ban","AI chip","tariff","export control","sanction",
+    "oil price","crude oil","WTI","Brent","OPEC",
+    "Taiwan strait","geopolit","earnings","GDP growth",
+    "SoftBank","Toyota","Sony","Nintendo","Tokyo Electron","Keyence",
+    "Fanuc","Hitachi","Mitsubishi","Sumitomo","Mizuho","SMBC",
+    "Japan stock","Japanese yen","Nikkei rally","sell-off",
+    "Bank of Japan","BOJ policy","yen intervention",
 ]
 
-# ★ 중요도 키워드 (2차)
+# ★ 중요도 키워드 (2차) — 일본어 + 영어
 MEDIUM_KW = [
+    # 일본어
     "株式","株価","上場","IPO","投資","ファンド","ETF",
     "売上","利益","増収","増益","黒字","赤字",
     "受注","契約","提携","新製品","特許","FDA承認",
     "ソフトバンク","トヨタ","ソニー","任天堂","東京エレクトロン",
     "ファーストリテイリング","三菱UFJ","三井住友","みずほ",
     "輸出","輸入","需要","供給","市況","在庫",
+    "イラン","ウクライナ","ロシア","EU","中国","米国",
+    # 영어
+    "Japan","Japanese market","Asia stocks","Asia Pacific market",
+    "trade war","export","import","deficit","surplus",
+    "profit","revenue","forecast","outlook","downgrade","upgrade",
+    "risk-off","risk-on","volatility","selloff","rally",
+    "Fed","treasury","yield","bond","dollar",
+    "China","Korea","Asia","emerging market",
 ]
 
 
@@ -157,7 +178,7 @@ def _parse_rss(xml_text: str, source: str) -> list:
             pub_str = pub_jst.strftime("%Y-%m-%d %H:%M:%S")
 
             age_min = int((datetime.now(timezone.utc) - pub_dt.astimezone(timezone.utc)).total_seconds() / 60)
-            if age_min > 1440:  # 24시간 이상 오래된 뉴스 제외
+            if age_min > 1440:
                 continue
 
             items.append({
@@ -201,6 +222,10 @@ def fetch_rss(source: str, url: str) -> list:
                 score = 3
             else:
                 score = 2
+
+            # CNBC는 영어라서 score 2이면 제외 (관련 없는 영어뉴스 차단)
+            if source.startswith("cnbc") and score == 2:
+                continue
 
             item["score"] = score
             filtered.append(item)
