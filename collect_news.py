@@ -1,7 +1,13 @@
 """
 collect_news.py
-GitHub Actions에서 실행 — NHK/Yahoo/Investing.com RSS 수집 → VPS push
+GitHub Actions에서 실행 — NHK/Reuters/Bloomberg RSS 수집 → VPS push
 평일/주말 관계없이 5분마다 실행
+
+변경사항:
+- yahoo_fin/yahoo_it/yahoo_biz 제거 (자동차/생활 잡뉴스 주 소스)
+- reuters_jp/bloomberg_jp 추가 (GitHub Actions IP는 차단 안됨)
+- EXCLUDE_KW 대폭 강화 (자동차/생활/사건사고 등)
+- HIGH_KW 강화 (일본주식 직접 영향 키워드)
 """
 import os, re, time, hashlib, json
 from datetime import datetime, timezone, timedelta
@@ -19,61 +25,84 @@ HEADERS = {
 }
 
 RSS_FEEDS = [
-    # NHK 경제 특화 카테고리만
-    ("nhk_biz",   "https://www.nhk.or.jp/rss/news/cat5.xml"),   # 경제/기업
-    ("nhk_world", "https://www.nhk.or.jp/rss/news/cat4.xml"),   # 국제경제
-    ("nhk_eco",   "https://www.nhk.or.jp/rss/news/cat6.xml"),   # 과학/기술
-    # Yahoo Finance JP
-    ("yahoo_fin", "https://finance.yahoo.co.jp/rss/news"),
-    # Yahoo IT/비즈니스
-    ("yahoo_it",  "https://news.yahoo.co.jp/rss/topics/it.xml"),
-    ("yahoo_biz", "https://news.yahoo.co.jp/rss/topics/business.xml"),
+    # NHK 경제/금융 특화
+    ("nhk_biz",    "https://www.nhk.or.jp/rss/news/cat5.xml"),  # 경제/기업
+    ("nhk_world",  "https://www.nhk.or.jp/rss/news/cat4.xml"),  # 국제경제
+    ("nhk_eco",    "https://www.nhk.or.jp/rss/news/cat6.xml"),  # 과학/기술
+    # 금융 전문 (GitHub Actions IP는 차단 안됨)
+    ("reuters_jp", "https://feeds.reuters.com/reuters/JPBusinessNews"),
+    ("reuters_en", "https://feeds.reuters.com/reuters/businessNews"),
+    ("bloomberg",  "https://www.bloomberg.co.jp/feeds/bpol/news"),
+    # Yahoo Finance JP (비즈니스 카테고리 — 잡뉴스 많지만 필터링 적용)
+    ("yahoo_fin",  "https://news.yahoo.co.jp/rss/categories/business.xml"),
 ]
 
-# 제외 키워드 (증권 무관 완전 차단)
+# ★ 제외 키워드 (주식 무관 완전 차단)
 EXCLUDE_KW = [
-    # 스포츠 — 종목
-    "サッカー", "野球", "バスケ", "テニス", "ゴルフ", "ラグビー", "五輪",
-    "オリンピック", "W杯", "ワールドカップ", "高校野球", "Jリーグ", "プロ野球",
-    "カーリング", "スケート", "水泳", "体操", "柔道", "相撲", "レスリング",
-    "マラソン", "陸上", "バレー", "バドミントン", "卓球", "ボクシング",
-    # 스포츠 — 표현
-    "選手権", "リーグ戦", "優勝", "監督", "コーチ", "得点", "失点",
-    "ホームラン", "打点", "登板", "先発", "完投",
-    # 스포츠 — 선수 이름
-    "大谷翔平", "佐々木朗希", "鈴木誠也", "松井裕樹", "山本由伸",
-    "ドジャース", "ヤンキース", "パドレス", "カブス", "アストロズ",
-    "ホワイトソックス", "ブルージェイズ", "オリオールズ",
+    # 스포츠
+    "サッカー","野球","バスケ","テニス","ゴルフ","ラグビー","五輪",
+    "オリンピック","W杯","ワールドカップ","高校野球","Jリーグ","プロ野球",
+    "カーリング","スケート","水泳","体操","柔道","相撲","レスリング",
+    "マラソン","陸上","バレー","バドミントン","卓球","ボクシング","スポーツ",
+    "選手権","リーグ戦","監督","コーチ","ホームラン","打点","登板",
+    "大谷翔平","佐々木朗希","ドジャース","ヤンキース",
     # 연예/문화
-    "芸能", "アイドル", "歌手", "俳優", "映画", "ドラマ", "コンサート",
-    "音楽", "エンタメ", "バラエティ", "漫画", "アニメ",
-    # 날씨/재해
-    "台風", "大雨", "洪水", "土砂", "ひょう", "雷", "竜巻",
-    "熱中症", "梅雨", "積雪", "大雪", "津波", "震度",
-    # 사건사고
-    "交通事故", "火災", "逮捕", "容疑者", "殺人", "詐欺被害", "窃盗", "強盗",
-    "行方不明", "死亡事故", "遺体", "けが人",
+    "芸能","アイドル","歌手","俳優","映画","ドラマ","コンサート",
+    "音楽","エンタメ","バラエティ","漫画","アニメ","タレント",
+    # 자동차/이동수단 (주식 무관 기사)
+    "ベストカー","MotorFan","carview","乗りものニュース","Auto Messe",
+    "ノートオーラ","アルファード","ハイラックス","N-BOX","ロードスター",
+    "エアロ","カスタム","バイク","二輪","アウトバーン","レンタカー",
+    "夜行バス","航空機","エアフォース","エティハド","Aviation Wire",
+    # 생활/취미
+    "グルメ","食べ歩き","観光","旅行","温泉","スイーツ","ビリヤニ",
+    "ラーメン","そば","うどん","料理","レシピ","カフェ",
+    "日焼け","スキンケア","美容","ダイエット","健康食品","天然パーマ",
+    "時計","スマホ","Android","Wi-Fi","ガジェット",
+    "ドローン","測量","3D","VR","ゲーム","キャラ",
+    # 사건사고 (주식 무관)
+    "交通事故","火災","逮捕","容疑者","殺人","詐欺被害","窃盗","強盗",
+    "行方不明","死亡事故","遺体","列車衝突","落下","衝突事故",
+    "人身事故","重傷","軽傷","けが人","冷凍庫",
     # 황실/정치 (경제 무관)
-    "天皇", "皇后", "皇室", "陛下", "皇太子", "皇族",
-    "旧皇族", "知床", "参政", "立民", "公明", "維新",
-    "衆院", "参院", "委員会で可決", "法案",
-    # 외교 (경제 무관)
-    "表敬訪問", "記念式典", "慰霊", "追悼",
-    # 암호화폐
-    "ビットコイン", "暗号資産", "仮想通貨", "NFT", "ブロックチェーン",
-    # 기타
-    "グルメ", "食べ歩き", "観光", "旅行", "温泉", "スイーツ",
-    "スポーツ協会", "体育協会",
-    # 생활
-    "スイカ", "アライグマ", "クレーンゲーム", "スムージー", "弱冷車",
+    "天皇","皇后","皇室","陛下","皇太子","皇族","両陛下",
+    "慰霊","追悼","記念式典","表敬訪問","植樹",
+    "立民","公明","維新","参院","衆院","委員会",
+    "沖縄","糸満","博物館","ハラスメント","弁護士相談",
+    # 기타 잡뉴스
+    "フリマ","メルカリ","ヤフオク","相続","口座凍結",
+    "アウトドア","キャンプ","登山","釣り","ペット","犬","猫",
+    "住宅ローン変動金利","繰り上げ返済","ライフハック",
 ]
 
-# 중요도 키워드
+# ★ 고중요도 키워드 (일본주식 직접 영향)
 HIGH_KW = [
-    "日銀", "BOJ", "金利", "FOMC", "FRB", "GDP", "CPI", "PCE",
-    "利上げ", "利下げ", "関税", "決算", "業績修正", "TOB", "合併",
-    "上場廃止", "破産", "民事再生", "円高", "円安", "半導体",
-    "上場", "IPO", "増資", "自社株買い", "配当",
+    # 금융정책
+    "日銀","BOJ","金利","FOMC","FRB","利上げ","利下げ","量的緩和",
+    "政策金利","マイナス金利","為替介入",
+    # 경제지표
+    "GDP","CPI","PCE","雇用統計","インフレ","デフレ","景気後退",
+    "貿易収支","経常収支","消費者物価",
+    # 기업 이벤트
+    "決算","業績修正","上方修正","下方修正","TOB","買収","合併",
+    "上場廃止","破産","民事再生","増資","自社株買い","配当修正",
+    "社長交代","CEO","リストラ","希望退職","早期退職",
+    # 시장
+    "日経平均","TOPIX","円高","円安","円相場","ドル円","株価急落","急騰",
+    "半導体","AI投資","データセンター","関税","輸出規制","制裁",
+    "原油","WTI","天然ガス","金価格","銅価格",
+    # 지정학
+    "ホルムズ","台湾有事","地政学","安全保障","防衛費",
+]
+
+# ★ 중요도 키워드 (2차)
+MEDIUM_KW = [
+    "株式","株価","上場","IPO","投資","ファンド","ETF",
+    "売上","利益","増収","増益","黒字","赤字",
+    "受注","契約","提携","新製品","特許","FDA承認",
+    "ソフトバンク","トヨタ","ソニー","任天堂","東京エレクトロン",
+    "ファーストリテイリング","三菱UFJ","三井住友","みずほ",
+    "輸出","輸入","需要","供給","市況","在庫",
 ]
 
 
@@ -121,7 +150,7 @@ def _parse_rss(xml_text: str, source: str) -> list:
             pub_str = pub_jst.strftime("%Y-%m-%d %H:%M:%S")
 
             age_min = int((datetime.now(timezone.utc) - pub_dt.astimezone(timezone.utc)).total_seconds() / 60)
-            if age_min > 1440:
+            if age_min > 1440:  # 24시간 이상 오래된 뉴스 제외
                 continue
 
             items.append({
@@ -153,13 +182,23 @@ def fetch_rss(source: str, url: str) -> list:
         filtered = []
         for item in items:
             title = item.get("title", "")
+
+            # 제외 키워드 체크
             if any(kw in title for kw in EXCLUDE_KW):
                 continue
-            score = 3 if any(kw in title for kw in HIGH_KW) else 2
+
+            # 중요도 계산
+            if any(kw in title for kw in HIGH_KW):
+                score = 4
+            elif any(kw in title for kw in MEDIUM_KW):
+                score = 3
+            else:
+                score = 2
+
             item["score"] = score
             filtered.append(item)
 
-        print(f"  [{source}] {len(filtered)}건")
+        print(f"  [{source}] {len(filtered)}건 (원본 {len(items)}건)")
         return filtered
     except Exception as e:
         print(f"  [{source}] 오류: {e}")
@@ -168,6 +207,7 @@ def fetch_rss(source: str, url: str) -> list:
 
 def push_to_vps(items: list) -> dict:
     if not items:
+        print("  전송할 뉴스 없음")
         return {"saved": 0}
     try:
         res = requests.post(
@@ -196,7 +236,13 @@ def main():
                 all_items.append(item)
         time.sleep(1)
 
+    # score 높은 것 우선 정렬
+    all_items.sort(key=lambda x: (-x.get("score", 2), x.get("age_min", 9999)))
+
     print(f"\n총 {len(all_items)}건 수집 (중복 제거)")
+    print(f"  HIGH(score=4): {len([x for x in all_items if x['score']==4])}건")
+    print(f"  MED (score=3): {len([x for x in all_items if x['score']==3])}건")
+    print(f"  LOW (score=2): {len([x for x in all_items if x['score']==2])}건")
 
     result = push_to_vps(all_items)
     saved = result.get("saved", 0)
