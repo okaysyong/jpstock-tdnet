@@ -3,13 +3,16 @@ collect_themes.py
 GitHub Actions에서 실행 — 카부탄에서 종목 테마 수집 → VPS /push/themes
 닛케이225 + 거래대금 상위 종목 우선 수집
 """
-import os, re, time, json, requests, hashlib
+import os, re, time, json, requests, hashlib, sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 JST = ZoneInfo("Asia/Tokyo")
 VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "")
 VPS_TOKEN   = os.environ.get("VPS_TOKEN", "")
+
+def log(msg):
+    log(msg, flush=True)
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -99,7 +102,7 @@ def fetch_kabutan_themes(code: str) -> list:
         return result[:10]
 
     except Exception as e:
-        print(f"  [테마] {code} 오류: {e}")
+        log(f"  [테마] {code} 오류: {e}")
         return []
 
 
@@ -150,10 +153,10 @@ def get_top_codes_from_vps() -> list:
             if item.get("type") == "volume_ranking":
                 codes = [str(x["code"])[:4] for x in item.get("items", []) if x.get("code")]
                 if codes:
-                    print(f"  [VPS] 거래대금 상위 {len(codes)}개 종목")
+                    log(f"  [VPS] 거래대금 상위 {len(codes)}개 종목")
                     return codes
     except Exception as e:
-        print(f"  [VPS] 캐시 조회 실패: {e}")
+        log(f"  [VPS] 캐시 조회 실패: {e}")
     return []
 
 
@@ -171,14 +174,29 @@ def push_to_vps(items: list) -> None:
             timeout=30
         )
         data = res.json()
-        print(f"  [VPS] 테마 저장: {data.get('saved', 0)}건")
+        log(f"  [VPS] 테마 저장: {data.get('saved', 0)}건")
     except Exception as e:
-        print(f"  [VPS] push 오류: {e}")
+        log(f"  [VPS] push 오류: {e}")
 
 
 def main():
     now = datetime.now(JST)
-    print(f"=== 종목 테마 수집 시작: {now.strftime('%Y-%m-%d %H:%M JST')} ===")
+    log(f"=== 종목 테마 수집 시작: {now.strftime('%Y-%m-%d %H:%M JST')} ===")
+    log(f"VPS: {'있음' if VPS_API_URL else '없음'}")
+
+    # ★ 카부탄 접근 테스트
+    log("카부탄 접근 테스트 중...")
+    try:
+        test_r = SESSION.get("https://kabutan.jp/stock/?code=9984", timeout=15)
+        log(f"카부탄 HTTP: {test_r.status_code} / {len(test_r.text)}bytes")
+        if test_r.status_code != 200:
+            log("❌ 카부탄 접근 불가 — 종료")
+            return
+        test_themes = re.findall(r'/themes/\d+[^"]*">([^<]{2,20})</a>', test_r.text)
+        log(f"9984 테마: {test_themes[:5]}")
+    except Exception as e:
+        log(f"❌ 카부탄 오류: {e} — 종료")
+        return
 
     # 수집 대상: 닛케이225 + VPS 거래대금 상위
     target_codes = list(dict.fromkeys(NK225_CODES))  # 중복 제거
@@ -187,7 +205,7 @@ def main():
         if c not in target_codes:
             target_codes.append(c)
 
-    print(f"수집 대상: {len(target_codes)}종목")
+    log(f"수집 대상: {len(target_codes)}종목")
 
     # 이미 수집된 종목 확인 (VPS)
     already_done = set()
@@ -198,13 +216,13 @@ def main():
             for item in items:
                 if item.get("theme_updated_at"):  # 이미 테마 수집됨
                     already_done.add(item["code"])
-            print(f"  이미 수집된 종목: {len(already_done)}개")
+            log(f"  이미 수집된 종목: {len(already_done)}개")
     except Exception as e:
-        print(f"  기존 수집 확인 실패: {e}")
+        log(f"  기존 수집 확인 실패: {e}")
 
     # 미수집 종목만 대상
     to_collect = [c for c in target_codes if c not in already_done]
-    print(f"  신규 수집 대상: {len(to_collect)}종목")
+    log(f"  신규 수집 대상: {len(to_collect)}종목")
 
     all_results = []
     success = 0
@@ -220,7 +238,7 @@ def main():
             themes = fetch_minkabu_themes(code)
 
         if themes:
-            print(f"  [{i+1}/{len(to_collect)}] {code}: {themes[:3]}")
+            log(f"  [{i+1}/{len(to_collect)}] {code}: {themes[:3]}")
             all_results.append({
                 "code":   code,
                 "themes": themes,
@@ -242,8 +260,8 @@ def main():
     if all_results:
         push_to_vps(all_results)
 
-    print(f"\n=== 완료 ===")
-    print(f"  성공: {success}종목 / 테마 없음: {empty}종목")
+    log(f"\n=== 완료 ===")
+    log(f"  성공: {success}종목 / 테마 없음: {empty}종목")
 
 
 if __name__ == "__main__":
