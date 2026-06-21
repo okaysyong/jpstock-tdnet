@@ -1,0 +1,29 @@
+name: Collect Stock Themes
+
+on:
+  schedule:
+    # 매일 08:30 JST (전날 23:30 UTC) — 장 시작 전
+    - cron: '30 23 * * 0-4'
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  collect-themes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # 225종목 × 2초 = 약 8분, 여유있게 60분
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Collect stock themes
+        env:
+          VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+        run: python collect_themes.py
