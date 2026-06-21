@@ -54,7 +54,7 @@ NK225_CODES = [
 ]
 
 def fetch_kabutan_themes(code: str) -> list:
-    """카부탄 종목 페이지에서 関連テーマ 파싱"""
+    """카부탄 종목 페이지에서 投資テーマ 파싱"""
     url = f"https://kabutan.jp/stock/?code={code}"
     try:
         r = SESSION.get(url, timeout=15)
@@ -62,42 +62,23 @@ def fetch_kabutan_themes(code: str) -> list:
             return []
         html = r.text
 
-        themes = []
-
-        # ① 関連テーマ 섹션 파싱
-        # 패턴: <div class="theme_label">...</div> 또는 테마 링크
-        theme_section = re.search(
-            r'関連テーマ.*?</(?:div|section|table)>',
-            html, re.DOTALL
-        )
-        if theme_section:
-            theme_links = re.findall(
-                r'<a[^>]+theme[^>]*>([^<]{2,20})</a>',
-                theme_section.group(0)
-            )
-            themes.extend([t.strip() for t in theme_links if t.strip()])
-
-        # ② テーマ株 링크에서 추출
-        theme_links2 = re.findall(
-            r'/themes/\d+[^"]*"[^>]*>([^<]{2,20})</a>',
+        # /themes/?theme=XXX 또는 /themes/?industry=XX 링크에서 테마명 추출
+        theme_links = re.findall(
+            r'href="/themes/\?(?:theme|industry)=[^"]*"[^>]*>([^<]{2,20})<',
             html
         )
-        themes.extend([t.strip() for t in theme_links2 if t.strip()])
-
-        # ③ data-theme 속성에서 추출
-        data_themes = re.findall(r'data-theme="([^"]{2,20})"', html)
-        themes.extend(data_themes)
 
         # 중복 제거 + 정리
         seen = set()
         result = []
-        for t in themes:
+        skip = {"TOPIXコア30","TOPIX100","日経225","JPX日経400",
+                "東証プライム","東証スタンダード","東証グロース",
+                "情報・通信業","電気機器","機械","化学","銀行業"}
+        for t in theme_links:
             t = t.strip()
-            if t and t not in seen and len(t) >= 2 and len(t) <= 20:
-                # 일반적인 메뉴 항목 제외
-                if t not in ["テーマ株","株式","銘柄","ランキング","マーケット","ニュース"]:
-                    seen.add(t)
-                    result.append(t)
+            if t and t not in seen and t not in skip and 2 <= len(t) <= 20:
+                seen.add(t)
+                result.append(t)
 
         return result[:10]
 
