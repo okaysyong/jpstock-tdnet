@@ -2,8 +2,8 @@ name: JP Stock News Fetcher
 
 on:
   schedule:
-    - cron: '*/5 0-7 * * 1-5'   # 평일 09:00~16:00 JST (5분마다)
-    - cron: '0 */3 * * 0,6'     # 주말 3시간마다
+    - cron: '*/5 0-7 * * 1-5'    # 평일 09:00~16:00 JST (5분마다)
+    - cron: '*/30 * * * 0,6'     # 주말 30분마다
   workflow_dispatch:
 
 jobs:
@@ -104,12 +104,12 @@ jobs:
               "ソフトバンク","トヨタ","ソニー","任天堂","東京エレクトロン",
               "三菱UFJ","三井住友","みずほ","ファーストリテイリング",
               "輸出","輸入","需要","供給","市況",
-              "イラン","ウクライナ","ロシア","EU","中国","米国",
-              # 영어
-              "Japan","Japanese market","Asia stocks","Asia Pacific",
-              "trade","profit","revenue","forecast","outlook",
-              "risk-off","risk-on","volatility","Fed","treasury","yield",
-              "China","Korea","emerging market","dollar",
+              "イラン","ウクライナ","ロシア","EU規制","対中",
+              # 영어 (좁게 — 일본 주식 직접 영향만)
+              "Japan stock","Japanese yen","Nikkei","Bank of Japan",
+              "yen intervention","chip stocks","AI stocks",
+              "Fed minutes","FOMC minutes","treasury yield",
+              "oil supply","crude oil","OPEC cut",
           ]
 
           headers = {
