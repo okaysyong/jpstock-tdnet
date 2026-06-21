@@ -12,7 +12,7 @@ VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "")
 VPS_TOKEN   = os.environ.get("VPS_TOKEN", "")
 
 def log(msg):
-    log(msg, flush=True)
+    print(msg, flush=True)
 
 SESSION = requests.Session()
 SESSION.headers.update({
