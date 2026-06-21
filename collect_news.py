@@ -123,14 +123,12 @@ MEDIUM_KW = [
     "ソフトバンク","トヨタ","ソニー","任天堂","東京エレクトロン",
     "ファーストリテイリング","三菱UFJ","三井住友","みずほ",
     "輸出","輸入","需要","供給","市況","在庫",
-    "イラン","ウクライナ","ロシア","EU","中国","米国",
-    # 영어
-    "Japan","Japanese market","Asia stocks","Asia Pacific market",
-    "trade war","export","import","deficit","surplus",
-    "profit","revenue","forecast","outlook","downgrade","upgrade",
-    "risk-off","risk-on","volatility","selloff","rally",
-    "Fed","treasury","yield","bond","dollar",
-    "China","Korea","Asia","emerging market",
+    "イラン","ウクライナ","EU規制","対中",
+    # 영어 (일본 주식 직접 영향만 — 좁게)
+    "Japan stock","Japanese yen","Nikkei","Bank of Japan",
+    "yen intervention","chip stock","AI stock","semiconductor stock",
+    "Fed minutes","FOMC minutes","treasury yield","bond yield",
+    "oil supply","crude oil","OPEC","energy price",
 ]
 
 
