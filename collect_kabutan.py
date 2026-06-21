@@ -200,16 +200,35 @@ def fetch_rating() -> list:
         items   = []
         seen    = set()
         trs = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
-        for tr in trs[:30]:
+        for tr in trs[:50]:
             code_m = re.search(r'code=(\d{4}[A-Z]?)', tr)
-            name_m = re.search(r'<a[^>]+stock[^>]+>([^<]+)</a>', tr)
-            tds    = re.findall(r'<td[^>]*>([^<]{2,40})</td>', tr)
-            if not code_m or len(tds) < 3: continue
-            code   = code_m.group(1)
-            name   = name_m.group(1).strip() if name_m else ""
-            info   = " ".join(td.strip() for td in tds[1:4] if td.strip())
-            if not info: continue
+            if not code_m: continue
+            code = code_m.group(1)
+
+            # 종목명: stock 링크에서 추출
+            name_m = re.search(r'<a[^>]+stock[^>]+>([^<]{2,30})</a>', tr)
+            name = name_m.group(1).strip() if name_m else ""
+
+            # 종목명 없으면 스킵
+            if not name or name.replace(",","").replace(".","").replace(" ","").isdigit():
+                continue
+
+            # 레이팅 정보 추출 (증권사명, 방향, 목표주가)
+            tds = re.findall(r'<td[^>]*>\s*([^<\s][^<]{1,40}?)\s*</td>', tr)
+            # 숫자만인 td 제외
+            info_parts = []
+            for td in tds:
+                td = td.strip()
+                if not td: continue
+                if td.replace(",","").replace(".","").replace(" ","").isdigit(): continue
+                if td == code or td == name: continue
+                if len(td) >= 2:
+                    info_parts.append(td)
+
+            if not info_parts: continue
+            info = " ".join(info_parts[:3])
             title = f"{name} {info}"
+
             uid = hashlib.md5(f"kab_rating_{today}_{code}_{info}".encode()).hexdigest()[:12]
             if uid in seen: continue
             seen.add(uid)
