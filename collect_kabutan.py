@@ -1,7 +1,12 @@
 """
 collect_kabutan.py
-카부탄/민카부 속보 뉴스 + 애널리스트 리포트 수집 → VPS push
+카부탄/민카부 속보 뉴스 + 애널리스트 리포트 + 업적수정/결산/M&A 수집 → VPS push
 GitHub Actions에서 5분마다 실행
+
+v2 변경사항:
+- 업적수정/결산/M&A/自社株 수집 추가 (페이지 파라미터 없이 안전하게)
+- 카부탄 경고 페이지에서 업적수정 종목 수집
+- 민카부 폴백 강화
 """
 import os, re, time, requests, hashlib
 from datetime import datetime
@@ -24,14 +29,17 @@ SESSION.headers.update({
 
 HIGH_KW = [
     "急騰","急落","ストップ高","ストップ安","S高","S安",
-    "上方修正","下方修正","増配","減配","自己株","TOB",
-    "合併","子会社","格上げ","格下げ","目標株価引き上げ",
-    "目標株価引き下げ","大幅高","大幅安","新高値","年初来高値",
+    "上方修正","下方修正","増配","減配","自己株","自社株",
+    "TOB","MBO","合併","買収","子会社化","格上げ","格下げ",
+    "目標株価引き上げ","目標株価引き下げ",
+    "大幅高","大幅安","新高値","年初来高値","年初来安値",
+    "業績修正","決算","増資","上場廃止","破産","民事再生",
 ]
 MED_KW = [
     "続伸","続落","反発","反落","堅調","軟調",
     "業績","黒字","赤字","増収","増益","減収","減益",
-    "受注","契約","提携","新製品",
+    "受注","契約","提携","新製品","特許","FDA",
+    "売上","利益","成長","拡大","投資","開発","生産",
 ]
 
 def classify_importance(title: str) -> int:
@@ -41,7 +49,7 @@ def classify_importance(title: str) -> int:
 
 
 def fetch_news_market() -> list:
-    """카부탄 마켓 속보"""
+    """카부탄 마켓 속보 (페이지 파라미터 없이 — 봇차단 우회)"""
     try:
         r = SESSION.get("https://kabutan.jp/news/marketnews/", timeout=15)
         if r.status_code != 200:
@@ -85,6 +93,60 @@ def fetch_news_market() -> list:
         return []
 
 
+def fetch_gyoseki_correction() -> list:
+    """업적수정 종목 수집 (카부탄 경고 페이지)"""
+    items = []
+    # 업적수정 페이지들 (파라미터 최소화)
+    targets = [
+        ("上方修正", "https://kabutan.jp/warning/?mode=2_1&market=1"),
+        ("下方修正", "https://kabutan.jp/warning/?mode=2_2&market=1"),
+        ("増配",     "https://kabutan.jp/warning/?mode=2_3&market=1"),
+        ("減配",     "https://kabutan.jp/warning/?mode=2_4&market=1"),
+        ("自社株買い", "https://kabutan.jp/warning/?mode=2_5&market=1"),
+    ]
+    today   = datetime.now(JST).strftime("%Y-%m-%d")
+    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    seen = set()
+
+    for label, url in targets:
+        try:
+            r = SESSION.get(url, timeout=15)
+            if r.status_code != 200:
+                continue
+            html = r.text
+            trs = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+            cnt = 0
+            for tr in trs[:20]:
+                code_m = re.search(r'code=(\d{4}[A-Z]?)', tr)
+                name_m = re.search(r'<a[^>]+stock[^>]+>([^<]+)</a>', tr)
+                if not code_m: continue
+                code = code_m.group(1)
+                name = name_m.group(1).strip() if name_m else code
+                title = f"{name} {label}"
+                uid = hashlib.md5(f"kab_gyoseki_{today}_{code}_{label}".encode()).hexdigest()[:12]
+                if uid in seen: continue
+                seen.add(uid)
+                items.append({
+                    "uid":          uid,
+                    "title":        f"[{code}] {title}",
+                    "summary":      "",
+                    "url":          url,
+                    "source":       "kabutan_gyoseki",
+                    "published_at": now_str,
+                    "stocks":       f'["{code}"]',
+                    "importance":   3,
+                })
+                cnt += 1
+            if cnt > 0:
+                print(f"  [{label}] {cnt}건")
+            time.sleep(1)
+        except Exception as e:
+            print(f"  [{label}] 오류: {e}")
+
+    print(f"  [업적수정 합계] {len(items)}건")
+    return items
+
+
 def fetch_minkabu_news() -> list:
     """민카부 속보 (카부탄 폴백)"""
     try:
@@ -97,7 +159,6 @@ def fetch_minkabu_news() -> list:
         now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
         items = []
         seen  = set()
-        # 종목코드 + 뉴스 제목 파싱
         code_rows = re.findall(
             r'/stock/(\d{4}[A-Z]?)[^"]*".*?'
             r'<a[^>]+href="/news/\d+"[^>]*>([^<]{5,100})</a>',
@@ -172,14 +233,16 @@ def fetch_rating() -> list:
 def fetch_stop_stocks() -> list:
     """스톱하이/스톱로"""
     items = []
-    for label, url in [("ストップ高", "https://kabutan.jp/warning/?mode=1_2&market=1"),
-                       ("ストップ安", "https://kabutan.jp/warning/?mode=1_3&market=1")]:
+    today   = datetime.now(JST).strftime("%Y-%m-%d")
+    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    for label, url in [
+        ("ストップ高", "https://kabutan.jp/warning/?mode=1_2&market=1"),
+        ("ストップ安", "https://kabutan.jp/warning/?mode=1_3&market=1"),
+    ]:
         try:
             r = SESSION.get(url, timeout=15)
             if r.status_code != 200: continue
-            html    = r.text
-            today   = datetime.now(JST).strftime("%Y-%m-%d")
-            now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+            html = r.text
             trs = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
             cnt = 0
             for tr in trs[:20]:
@@ -210,6 +273,7 @@ def fetch_stop_stocks() -> list:
 
 def push_to_vps(items: list) -> None:
     if not items or not VPS_API_URL:
+        print(f"  [VPS] 전송 스킵 (items={len(items)}, url={VPS_API_URL[:30] if VPS_API_URL else 'None'})")
         return
     try:
         headers = {"Content-Type": "application/json"}
@@ -231,6 +295,7 @@ def main():
     now = datetime.now(JST)
     print(f"=== 카부탄 속보 수집: {now.strftime('%Y-%m-%d %H:%M:%S')} JST ===")
     all_items = []
+    seen_uids = set()
 
     # 1. 속보 뉴스 (카부탄 → 민카부 폴백)
     news = fetch_news_market()
@@ -240,15 +305,27 @@ def main():
     all_items.extend(news)
     time.sleep(2)
 
-    # 2. 레이팅 변경
+    # 2. 업적수정/결산/自社株 (★ 신규 추가)
+    gyoseki = fetch_gyoseki_correction()
+    all_items.extend(gyoseki)
+    time.sleep(2)
+
+    # 3. 레이팅 변경
     all_items.extend(fetch_rating())
     time.sleep(2)
 
-    # 3. 스톱하이/스톱로
+    # 4. 스톱하이/스톱로
     all_items.extend(fetch_stop_stocks())
 
-    print(f"\n총 {len(all_items)}건 수집")
-    push_to_vps(all_items)
+    # 중복 제거
+    unique = []
+    for item in all_items:
+        if item["uid"] not in seen_uids:
+            seen_uids.add(item["uid"])
+            unique.append(item)
+
+    print(f"\n총 {len(unique)}건 수집")
+    push_to_vps(unique)
     print("완료")
 
 
