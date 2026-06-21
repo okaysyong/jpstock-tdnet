@@ -225,6 +225,10 @@ def fetch_rss(source: str, url: str) -> list:
             if source.startswith("cnbc") and score == 2:
                 continue
 
+            # yahoo_biz는 HIGH(4)/MED(3)만 저장 (잡뉴스 차단)
+            if source == "yahoo_fin" and score <= 2:
+                continue
+
             item["score"] = score
             filtered.append(item)
 
