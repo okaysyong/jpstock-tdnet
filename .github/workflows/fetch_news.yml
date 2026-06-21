@@ -147,6 +147,9 @@ jobs:
                           score = 3
                       else:
                           score = 2
+                      # yahoo_biz는 HIGH/MED만 저장 (잡뉴스 차단)
+                      if source == "yahoo_biz" and score <= 2:
+                          continue
                       uid = hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
                       if uid in seen_uids:
                           continue
