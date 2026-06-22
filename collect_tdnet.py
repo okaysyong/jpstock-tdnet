@@ -6,7 +6,7 @@ import os, sys, json, time, requests
 from datetime import datetime, timezone, timedelta
 
 JST = timezone(timedelta(hours=9))
-VPS_URL = os.environ.get("VPS_URL", "https://jpstocklive.com")
+VPS_URL = os.environ.get("VPS_NEWS_API_URL", os.environ.get("VPS_URL", "https://jpstocklive.com"))
 TIMEOUT = 30
 
 HEADERS = {
