@@ -70,13 +70,13 @@ def fetch_tdnet():
                 disc_id  = f"{date_str}_{code}_{time_str.replace(':','')}"
                 items.append({
                     "disclosure_id": disc_id,
-                    "code": code,
+                    "stock_code": code,
                     "company_name": company,
                     "title": title,
                     "rank": _rank(title),
                     "disclosed_at": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str}:00",
                     "time_str": time_str,
-                    "url": link,
+                    "pdf_url": link,
                 })
                 page_count += 1
             print(f"  페이지 {page}: {page_count}건")
