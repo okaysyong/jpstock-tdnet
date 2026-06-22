@@ -44,14 +44,24 @@ def fetch_tdnet():
             r.encoding = 'utf-8'
             soup = BeautifulSoup(r.text, 'html.parser')
 
-            # 디버그: 테이블 구조 확인
+            # 디버그: 실제 구조 파악
             if page == 1:
                 tables = soup.find_all('table')
                 print(f"  [디버그] 테이블 수: {len(tables)}")
-                rows_all = soup.find_all('tr')
-                print(f"  [디버그] tr 수: {len(rows_all)}")
-                if rows_all:
-                    print(f"  [디버그] 첫 tr: {str(rows_all[0])[:200]}")
+                # 테이블 ID/class 출력
+                for i, tbl in enumerate(tables[:5]):
+                    print(f"  [디버그] 테이블{i}: id={tbl.get('id','')} class={tbl.get('class','')}")
+                # kaiji 관련 찾기
+                kaiji = soup.find(id=re.compile('kaiji'))
+                if kaiji:
+                    print(f"  [디버그] kaiji: {str(kaiji)[:300]}")
+                # class에 list가 포함된 테이블
+                list_tbl = soup.find('table', id=re.compile('list|kaiji-info'))
+                if list_tbl:
+                    rows2 = list_tbl.find_all('tr')
+                    print(f"  [디버그] list테이블 tr수: {len(rows2)}")
+                    if rows2:
+                        print(f"  [디버그] 첫행: {str(rows2[0])[:300]}")
 
             # 공시 테이블 행 파싱
             rows = soup.find_all('tr')
