@@ -1,8 +1,7 @@
 name: TDnet Collect
 on:
   schedule:
-    # 09:00~16:30 JST = 00:00~07:30 UTC, 평일(월-금), 5분마다
-    - cron: '*/5 0-7 * * 1-5'
+    - cron: '*/5 * * * 1-5'
   workflow_dispatch:
 jobs:
   collect:
