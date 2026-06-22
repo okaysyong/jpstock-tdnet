@@ -3,16 +3,17 @@
 collect_tdnet.py — GitHub Actions에서 TDnet 공시 수집 → VPS push
 소스: TDnet 직접 HTML (release.tdnet.info)
 """
-import os, sys, json, re, requests
+import os, sys, re, requests
 from datetime import datetime, timezone, timedelta
+from bs4 import BeautifulSoup
 
 JST = timezone(timedelta(hours=9))
 VPS_URL = os.environ.get("VPS_NEWS_API_URL", os.environ.get("VPS_URL", "https://jpstocklive.com"))
 TIMEOUT = 30
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html,*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,*/*",
     "Accept-Language": "ja,en;q=0.9",
 }
 
@@ -33,32 +34,58 @@ def fetch_tdnet():
     date_str = now_jst.strftime("%Y%m%d")
     items = []
 
-    # TDnet 직접 HTML 스크래핑
-    for page in range(1, 6):  # 최대 5페이지
+    for page in range(1, 6):
         url = f"https://www.release.tdnet.info/inbs/I_list_{page:03d}_{date_str}.html"
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code != 200:
+                print(f"  페이지 {page}: HTTP {r.status_code}")
                 break
             r.encoding = 'utf-8'
-            html = r.text
+            soup = BeautifulSoup(r.text, 'html.parser')
 
-            # 공시 행 파싱
-            # <td class="...">시간</td><td>코드</td><td>회사명</td><td>제목</td>
-            rows = re.findall(
-                r'<td[^>]*class="[^"]*tm[^"]*"[^>]*>(\d{2}:\d{2})</td>'
-                r'.*?<td[^>]*>(\d{4})</td>'
-                r'.*?<td[^>]*>(.*?)</td>'
-                r'.*?<td[^>]*><a href="([^"]+)"[^>]*>(.*?)</a>',
-                html, re.DOTALL
-            )
+            # 디버그: 테이블 구조 확인
+            if page == 1:
+                tables = soup.find_all('table')
+                print(f"  [디버그] 테이블 수: {len(tables)}")
+                rows_all = soup.find_all('tr')
+                print(f"  [디버그] tr 수: {len(rows_all)}")
+                if rows_all:
+                    print(f"  [디버그] 첫 tr: {str(rows_all[0])[:200]}")
+
+            # 공시 테이블 행 파싱
+            rows = soup.find_all('tr')
+            page_count = 0
             for row in rows:
-                time_str, code, company, link, title = row
-                company = re.sub(r'<[^>]+>', '', company).strip()
-                title = re.sub(r'<[^>]+>', '', title).strip()
-                if not code or not title: continue
+                tds = row.find_all('td')
+                if len(tds) < 5:
+                    continue
+                # 시간(HH:MM), 코드(4자리), 회사명, 제목 순서 파악
+                texts = [td.get_text(strip=True) for td in tds]
+                # 시간 패턴 찾기
+                time_str = ""
+                code = ""
+                company = ""
+                title = ""
+                link = ""
+                for i, td in enumerate(tds):
+                    t = td.get_text(strip=True)
+                    if re.match(r'^\d{2}:\d{2}$', t):
+                        time_str = t
+                    elif re.match(r'^\d{4}$', t) and not code:
+                        code = t
+                    elif td.find('a') and not title:
+                        a = td.find('a')
+                        title = a.get_text(strip=True)
+                        href = a.get('href', '')
+                        link = f"https://www.release.tdnet.info/inbs/{href}" if href and not href.startswith('http') else href
+                    elif code and time_str and not company and t and not re.match(r'^\d', t):
+                        company = t
+
+                if not code or not title or not time_str:
+                    continue
+
                 disc_id = f"{date_str}_{code}_{time_str.replace(':','')}"
-                full_url = f"https://www.release.tdnet.info/inbs/{link}" if link and not link.startswith('http') else link
                 items.append({
                     "disclosure_id": disc_id,
                     "code": code[:4],
@@ -67,10 +94,13 @@ def fetch_tdnet():
                     "rank": _rank(title),
                     "disclosed_at": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str}:00",
                     "time_str": time_str,
-                    "url": full_url,
+                    "url": link,
                 })
-            print(f"  페이지 {page}: {len(rows)}건")
-            if len(rows) < 50: break  # 마지막 페이지
+                page_count += 1
+
+            print(f"  페이지 {page}: {page_count}건")
+            if page_count < 50:
+                break
         except Exception as e:
             print(f"⚠️ 페이지 {page}: {e}")
             break
