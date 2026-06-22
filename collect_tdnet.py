@@ -44,53 +44,33 @@ def fetch_tdnet():
             r.encoding = 'utf-8'
             soup = BeautifulSoup(r.text, 'html.parser')
 
-            # 디버그: main-list-table 구조 확인
-            if page == 1:
-                main_tbl = soup.find('table', id='main-list-table')
-                if main_tbl:
-                    rows2 = main_tbl.find_all('tr')
-                    print(f"  [디버그] main-list-table tr수: {len(rows2)}")
-                    for i, row in enumerate(rows2[:3]):
-                        print(f"  [디버그] 행{i}: {str(row)[:400]}")
-                else:
-                    print("  [디버그] main-list-table 없음")
+            # main-list-table에서 공시 파싱
+            main_tbl = soup.find('table', id='main-list-table')
+            if not main_tbl:
+                print(f"  페이지 {page}: main-list-table 없음")
+                break
 
-            # 공시 테이블 행 파싱
-            rows = soup.find_all('tr')
             page_count = 0
-            for row in rows:
-                tds = row.find_all('td')
-                if len(tds) < 5:
+            for row in main_tbl.find_all('tr'):
+                time_td   = row.find('td', class_=re.compile('kjTime'))
+                code_td   = row.find('td', class_=re.compile('kjCode'))
+                name_td   = row.find('td', class_=re.compile('kjName'))
+                title_td  = row.find('td', class_=re.compile('kjTitle'))
+                if not (time_td and code_td and title_td):
                     continue
-                # 시간(HH:MM), 코드(4자리), 회사명, 제목 순서 파악
-                texts = [td.get_text(strip=True) for td in tds]
-                # 시간 패턴 찾기
-                time_str = ""
-                code = ""
-                company = ""
-                title = ""
-                link = ""
-                for i, td in enumerate(tds):
-                    t = td.get_text(strip=True)
-                    if re.match(r'^\d{2}:\d{2}$', t):
-                        time_str = t
-                    elif re.match(r'^\d{4}$', t) and not code:
-                        code = t
-                    elif td.find('a') and not title:
-                        a = td.find('a')
-                        title = a.get_text(strip=True)
-                        href = a.get('href', '')
-                        link = f"https://www.release.tdnet.info/inbs/{href}" if href and not href.startswith('http') else href
-                    elif code and time_str and not company and t and not re.match(r'^\d', t):
-                        company = t
-
-                if not code or not title or not time_str:
-                    continue
-
-                disc_id = f"{date_str}_{code}_{time_str.replace(':','')}"
+                time_str = time_td.get_text(strip=True)
+                code     = code_td.get_text(strip=True)[:4]
+                company  = name_td.get_text(strip=True) if name_td else ""
+                a_tag    = title_td.find('a')
+                if not a_tag: continue
+                title    = a_tag.get_text(strip=True)
+                href     = a_tag.get('href', '')
+                link     = f"https://www.release.tdnet.info/inbs/{href}" if href and not href.startswith('http') else href
+                if not code or not title: continue
+                disc_id  = f"{date_str}_{code}_{time_str.replace(':','')}"
                 items.append({
                     "disclosure_id": disc_id,
-                    "code": code[:4],
+                    "code": code,
                     "company_name": company,
                     "title": title,
                     "rank": _rank(title),
@@ -99,7 +79,6 @@ def fetch_tdnet():
                     "url": link,
                 })
                 page_count += 1
-
             print(f"  페이지 {page}: {page_count}건")
             if page_count < 50:
                 break
