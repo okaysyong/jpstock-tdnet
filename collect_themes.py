@@ -119,14 +119,9 @@ def main():
         log("❌ 종목 코드 없음 — 종료")
         return
 
-    # 이미 수집된 종목 제외
-    already_done = get_already_done_from_vps()
-    to_collect = [c for c in all_codes if c not in already_done]
-    log(f"수집 대상: {len(to_collect)}종목 (전체 {len(all_codes)}개 중 미수집)")
-
-    if not to_collect:
-        log("모든 종목 이미 수집 완료!")
-        return
+    # 전종목 수집 (변경/신규 모두 업데이트)
+    to_collect = all_codes
+    log(f"수집 대상: {len(to_collect)}종목 (전체 수집)")
 
     all_results = []
     success = 0
