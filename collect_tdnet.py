@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 collect_tdnet.py — GitHub Actions에서 TDnet 공시 수집 → VPS push
+소스: TDnet 직접 HTML (release.tdnet.info)
 """
-import os, sys, json, time, requests
+import os, sys, json, re, requests
 from datetime import datetime, timezone, timedelta
 
 JST = timezone(timedelta(hours=9))
@@ -11,11 +12,10 @@ TIMEOUT = 30
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, */*",
+    "Accept": "text/html,*/*",
     "Accept-Language": "ja,en;q=0.9",
 }
 
-# 중요도 분류
 def _rank(title: str) -> int:
     t = title or ""
     if any(k in t for k in ["決算短信", "業績予想の修正", "配当予想の修正", "TOB", "MBO",
@@ -29,59 +29,55 @@ def _rank(title: str) -> int:
     return 1
 
 def fetch_tdnet():
-    """yanoshin API에서 TDnet 수집"""
-    items = []
     now_jst = datetime.now(JST)
     date_str = now_jst.strftime("%Y%m%d")
+    items = []
 
-    # yanoshin API
-    urls = [
-        f"https://webapi.yanoshin.jp/webapi/tdnet/list/today.json?limit=100",
-        f"https://webapi.yanoshin.jp/webapi/tdnet/list/{date_str}.json?limit=100",
-    ]
-    for url in urls:
+    # TDnet 직접 HTML 스크래핑
+    for page in range(1, 6):  # 최대 5페이지
+        url = f"https://www.release.tdnet.info/inbs/I_list_{page:03d}_{date_str}.html"
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code != 200:
-                continue
-            data = r.json()
-            records = data if isinstance(data, list) else data.get("items", data.get("list", []))
-            for rec in records:
-                code = str(rec.get("company_code") or rec.get("code") or "").strip()[:4]
-                title = rec.get("title") or rec.get("name") or ""
-                disclosed = rec.get("disclosed_at") or rec.get("datetime") or ""
-                disc_id = str(rec.get("id") or rec.get("disclosure_id") or "")
-                url_link = rec.get("url") or rec.get("link") or ""
-                company = rec.get("company_name") or rec.get("name_jp") or ""
+                break
+            r.encoding = 'utf-8'
+            html = r.text
 
+            # 공시 행 파싱
+            # <td class="...">시간</td><td>코드</td><td>회사명</td><td>제목</td>
+            rows = re.findall(
+                r'<td[^>]*class="[^"]*tm[^"]*"[^>]*>(\d{2}:\d{2})</td>'
+                r'.*?<td[^>]*>(\d{4})</td>'
+                r'.*?<td[^>]*>(.*?)</td>'
+                r'.*?<td[^>]*><a href="([^"]+)"[^>]*>(.*?)</a>',
+                html, re.DOTALL
+            )
+            for row in rows:
+                time_str, code, company, link, title = row
+                company = re.sub(r'<[^>]+>', '', company).strip()
+                title = re.sub(r'<[^>]+>', '', title).strip()
                 if not code or not title: continue
-                rank = _rank(title)
-                # 時間 추출 (HH:MM)
-                time_str = ""
-                if disclosed and len(disclosed) >= 16:
-                    time_str = disclosed[11:16]
-
+                disc_id = f"{date_str}_{code}_{time_str.replace(':','')}"
+                full_url = f"https://www.release.tdnet.info/inbs/{link}" if link and not link.startswith('http') else link
                 items.append({
                     "disclosure_id": disc_id,
-                    "code": code,
+                    "code": code[:4],
                     "company_name": company,
                     "title": title,
-                    "rank": rank,
-                    "disclosed_at": disclosed,
+                    "rank": _rank(title),
+                    "disclosed_at": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str}:00",
                     "time_str": time_str,
-                    "url": url_link,
+                    "url": full_url,
                 })
-            if items:
-                print(f"✅ yanoshin: {len(items)}건")
-                break
+            print(f"  페이지 {page}: {len(rows)}건")
+            if len(rows) < 50: break  # 마지막 페이지
         except Exception as e:
-            print(f"⚠️ {url}: {e}")
-            continue
+            print(f"⚠️ 페이지 {page}: {e}")
+            break
 
     return items
 
 def push_to_vps(items):
-    """VPS에 공시 데이터 push"""
     if not items:
         print("전송할 공시 없음")
         return
