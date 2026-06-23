@@ -2,8 +2,8 @@ name: JP Stock News Fetcher
 
 on:
   schedule:
-    - cron: '*/5 0-7 * * 1-5'    # 평일 09:00~16:00 JST (5분마다)
-    - cron: '*/30 * * * 0,6'     # 주말 30분마다
+    - cron: '*/5 * * * 1-5'     # 평일 24시간 5분마다
+    - cron: '*/30 * * * 0,6'    # 주말 30분마다
   workflow_dispatch:
 
 jobs:
