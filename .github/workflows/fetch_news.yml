@@ -12,13 +12,15 @@ jobs:
     timeout-minutes: 8
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests feedparser pytz
+        run: pip install requests feedparser pytz beautifulsoup4
 
       - name: Fetch and push news
         env:
@@ -34,51 +36,37 @@ jobs:
           VPS_TOKEN = os.environ.get("VPS_TOKEN", "")
 
           RSS_FEEDS = [
-              # NHK 경제/기업 특화
-              ("nhk_eco",    "https://www.nhk.or.jp/rss/news/cat5.xml"),   # 경제/기업 ★
-              ("nhk_world",  "https://www.nhk.or.jp/rss/news/cat4.xml"),   # 국제경제
-              ("nhk_sci",    "https://www.nhk.or.jp/rss/news/cat6.xml"),   # 과학/기술
-              # CNBC (미국장/글로벌 거시 — 주식 직접 영향)
-              ("cnbc_asia",  "https://www.cnbc.com/id/20910258/device/rss/rss.html"),   # Asia Pacific
-              ("cnbc_world", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),  # World
-              ("cnbc_fin",   "https://www.cnbc.com/id/10000664/device/rss/rss.html"),   # Finance
-              # Yahoo Finance JP (필터링 강화)
+              ("nhk_eco",    "https://www.nhk.or.jp/rss/news/cat5.xml"),
+              ("nhk_world",  "https://www.nhk.or.jp/rss/news/cat4.xml"),
+              ("nhk_sci",    "https://www.nhk.or.jp/rss/news/cat6.xml"),
+              ("cnbc_asia",  "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
+              ("cnbc_world", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+              ("cnbc_fin",   "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
               ("yahoo_biz",  "https://news.yahoo.co.jp/rss/categories/business.xml"),
           ]
 
-          # 제외 키워드
           EXCLUDE_KW = [
-              # 스포츠
               "サッカー","野球","バスケ","テニス","ゴルフ","ラグビー","五輪",
               "オリンピック","W杯","ワールドカップ","高校野球","Jリーグ","プロ野球",
               "大リーグ","MLB","NFL","NBA","ドジャース","ヤンキース",
               "大谷","佐々木朗","鈴木誠","松井裕","ホームラン","打点","登板",
               "大相撲","力士","横綱","金メダル","銀メダル","マラソン","駅伝",
-              # 연예/문화
               "芸能","アイドル","歌手","俳優","映画","ドラマ","コンサート",
               "音楽","エンタメ","バラエティ","漫画","アニメ","タレント",
-              # 날씨/재해
               "台風","大雨","洪水","土砂","ひょう","雷","竜巻","熱中症","梅雨",
-              # 사건사고
               "交通事故","火災","逮捕","容疑者","殺人","詐欺被害","強盗",
               "行方不明","死亡事故","遺体","列車衝突","落下","衝突事故",
-              # 황실/외교 무관
               "表敬訪問","記念式典","慰霊","追悼",
               "天皇","皇后","皇室","陛下","皇太子","皇族","両陛下",
-              # 생활/취미
               "グルメ","食べ歩き","観光","旅行","温泉","スイーツ","ビリヤニ",
               "日焼け","スキンケア","美容","ダイエット",
-              # 자동차 잡지
               "MotorFan","carview","ベストカーWeb","乗りものニュース",
               "Auto Messe","Aviation Wire","バイクのニュース",
-              # 기타
               "定時制","通信制","フリマ","メルカリ","相続","口座凍結",
               "パチンコ","競馬","宝くじ","ハローワーク",
           ]
 
-          # 고중요도 키워드 (일본어+영어)
           HIGH_KW = [
-              # 일본어
               "日銀","BOJ","金利","FOMC","FRB","利上げ","利下げ",
               "GDP","CPI","PCE","雇用統計","インフレ","景気後退",
               "決算","業績修正","上方修正","下方修正","TOB","買収","合併",
@@ -86,7 +74,6 @@ jobs:
               "日経平均","TOPIX","円高","円安","円相場","ドル円",
               "半導体","AI投資","関税","輸出規制","制裁",
               "原油","WTI","天然ガス","ホルムズ","台湾",
-              # 영어 (CNBC용)
               "Bank of Japan","interest rate","Federal Reserve","Fed rate",
               "rate hike","rate cut","inflation","CPI","jobs report",
               "Nikkei","yen","USD/JPY","semiconductor","chip","tariff",
@@ -95,9 +82,7 @@ jobs:
               "Japan stock","Japanese yen","sell-off","rally",
           ]
 
-          # 중요도 키워드 (일본어+영어)
           MEDIUM_KW = [
-              # 일본어
               "株式","株価","上場","IPO","投資","ファンド",
               "売上","利益","増収","増益","黒字","赤字",
               "受注","契約","提携","新製品","特許",
@@ -105,7 +90,6 @@ jobs:
               "三菱UFJ","三井住友","みずほ","ファーストリテイリング",
               "輸出","輸入","需要","供給","市況",
               "イラン","ウクライナ","ロシア","EU規制","対中",
-              # 영어 (좁게 — 일본 주식 직접 영향만)
               "Japan stock","Japanese yen","Nikkei","Bank of Japan",
               "yen intervention","chip stocks","AI stocks",
               "Fed minutes","FOMC minutes","treasury yield",
@@ -133,21 +117,17 @@ jobs:
                       title = (entry.get("title") or "").strip()
                       if not title:
                           continue
-                      # 제외 키워드
                       if any(kw in title for kw in EXCLUDE_KW):
                           continue
-                      # CNBC는 HIGH/MEDIUM 키워드 있는 것만
                       if source.startswith("cnbc"):
                           if not any(kw in title for kw in HIGH_KW + MEDIUM_KW):
                               continue
-                      # 중요도 계산
                       if any(kw in title for kw in HIGH_KW):
                           score = 4
                       elif any(kw in title for kw in MEDIUM_KW):
                           score = 3
                       else:
                           score = 2
-                      # yahoo_biz는 HIGH/MED만 저장 (잡뉴스 차단)
                       if source == "yahoo_biz" and score <= 2:
                           continue
                       uid = hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
@@ -173,7 +153,6 @@ jobs:
                   print(f"ERR {source}: {e}")
               time.sleep(1)
 
-          # score 높은 것 우선 정렬
           all_news.sort(key=lambda x: -x.get("score", 2))
 
           print(f"Total: {len(all_news)}")
@@ -195,3 +174,9 @@ jobs:
           except Exception as e:
               print(f"VPS ERR: {e}")
           PYEOF
+
+      - name: Collect TDnet disclosures
+        env:
+          VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+        run: python collect_tdnet.py
