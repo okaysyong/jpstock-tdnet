@@ -9,7 +9,7 @@ on:
 jobs:
   fetch-news:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests feedparser pytz beautifulsoup4
+        run: pip install requests feedparser pytz beautifulsoup4 pypdf
 
       - name: Fetch and push news
         env:
@@ -181,10 +181,8 @@ jobs:
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
         run: python collect_tdnet.py
 
-        - name: Parse disclosure PDFs
+      - name: Parse disclosure PDFs
         env:
           VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
-        run: |
-          pip install pypdf
-          python parse_disc_pdf.py
+        run: python parse_disc_pdf.py
