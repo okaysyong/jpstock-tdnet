@@ -180,3 +180,11 @@ jobs:
           VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
         run: python collect_tdnet.py
+
+        - name: Parse disclosure PDFs
+        env:
+          VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+        run: |
+          pip install pypdf
+          python parse_disc_pdf.py
