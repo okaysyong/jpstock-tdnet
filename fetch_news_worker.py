@@ -7,8 +7,6 @@ VPS_TOKEN = os.environ.get("VPS_TOKEN", "")
 
 RSS_FEEDS = [
     ("nhk_eco",    "https://www.nhk.or.jp/rss/news/cat5.xml"),
-    ("nhk_world",  "https://www.nhk.or.jp/rss/news/cat4.xml"),
-    ("nhk_sci",    "https://www.nhk.or.jp/rss/news/cat6.xml"),
     ("cnbc_asia",  "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
     ("cnbc_world", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
     ("cnbc_fin",   "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
