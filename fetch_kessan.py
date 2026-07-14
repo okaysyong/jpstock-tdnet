@@ -10,64 +10,85 @@ HEADERS_SP = {
     "Accept-Language": "ja,en;q=0.9",
 }
 
-def fetch_kabuyoho() -> list:
-    url = "https://kabuyoho.jp/sp/calender"
-    try:
-        res = requests.get(url, headers=HEADERS_SP, timeout=15)
-        if res.status_code != 200:
-            print(f"  kabuyoho HTTP {res.status_code}")
-            return []
-        html = res.text
-    except Exception as e:
-        print(f"  kabuyoho 오류: {e}")
-        return []
-
+def parse_cards(html: str, fallback_date: str) -> list:
     now = datetime.now(JST)
     items = []
     seen = set()
-
-    # 카드 단위 파싱
-    # 패턴: bcode=XXXX → 종목명 → 결산종류(1Q/2Q/3Q/本/中間/通期) → 発表日: YYYY/MM/DD
     cards = re.findall(
-        r'href="/sp/reportTop\?bcode=(\d{4})".*?'   # 종목코드
-        r'<p>\s*([^<\n]{1,20}?)\s*<br>.*?'           # 종목명
-        r'class="nmbr">\d{4}</span>.*?'               # 코드확인
-        r'<span[^>]*>\s*(1Q|2Q|3Q|4Q|本決算|中間|通期|本)\s*</span>.*?'  # 결산종류
-        r'(\d{4}/\d{2}/\d{2})',                       # 발표일
+        r'href="/sp/reportTop\?bcode=(\d{4})".*?'
+        r'<p>\s*([^<\n]{1,20}?)\s*<br>.*?'
+        r'class="nmbr">\d{4}</span>.*?'
+        r'<span[^>]*>\s*(1Q|2Q|3Q|4Q|本決算|中間|通期|本)\s*</span>.*?'
+        r'(\d{4}/\d{2}/\d{2})',
         html, re.DOTALL
     )
-
-    print(f"  카드 파싱: {len(cards)}건")
-
     for code, name, ktype, date_raw in cards:
-        # 済(완료) 종목도 포함 — 발표일 기준으로 필터는 VPS에서
         try:
             dt = datetime.strptime(date_raw, "%Y/%m/%d")
             kessan_date = dt.strftime("%Y-%m-%d")
         except:
-            continue
-
-        # 과거 데이터 스킵 (오늘 이전)
-        if dt.date() < now.date():
-            continue
-
+            kessan_date = fallback_date
         key = f"{code}_{kessan_date}"
         if key in seen:
             continue
         seen.add(key)
-
         items.append({
-            "code":          code[:4],
-            "name":          name.strip()[:20],
-            "market":        "",
-            "fiscal_period": ktype.strip(),
-            "kessan_date":   kessan_date,
-            "kessan_time":   "",
-            "source":        "kabuyoho",
+            "code": code[:4], "name": name.strip()[:20],
+            "market": "", "fiscal_period": ktype.strip(),
+            "kessan_date": kessan_date, "kessan_time": "",
+            "source": "kabuyoho",
         })
-
     return items
 
+def fetch_kabuyoho_all(days: int = 14) -> list:
+    """날짜별 URL 시도: ?date=YYYYMMDD 또는 ?ymd=YYYY-MM-DD"""
+    now = datetime.now(JST)
+    all_items = []
+    seen_keys = set()
+
+    # 먼저 기본 URL (당일)
+    res = requests.get("https://kabuyoho.jp/sp/calender", headers=HEADERS_SP, timeout=15)
+    if res.status_code == 200:
+        items = parse_cards(res.text, now.strftime("%Y-%m-%d"))
+        for it in items:
+            k = f"{it['code']}_{it['kessan_date']}"
+            if k not in seen_keys:
+                seen_keys.add(k)
+                all_items.append(it)
+        print(f"  기본URL: {len(items)}건")
+
+    # 날짜 파라미터 시도
+    for delta in range(1, days):
+        target = now + timedelta(days=delta)
+        if target.weekday() >= 5:
+            continue
+        date_str = target.strftime("%Y-%m-%d")
+        date_str2 = target.strftime("%Y%m%d")
+
+        # 패턴1: ?date=YYYYMMDD
+        for url in [
+            f"https://kabuyoho.jp/sp/calender?date={date_str2}",
+            f"https://kabuyoho.jp/sp/calender?ymd={date_str}",
+            f"https://kabuyoho.jp/sp/calender?dt={date_str2}",
+        ]:
+            try:
+                res = requests.get(url, headers=HEADERS_SP, timeout=10)
+                if res.status_code == 200 and len(res.text) > 10000:
+                    items = parse_cards(res.text, date_str)
+                    new = 0
+                    for it in items:
+                        k = f"{it['code']}_{it['kessan_date']}"
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            all_items.append(it)
+                            new += 1
+                    if new > 0:
+                        print(f"  {date_str} ({url.split('?')[1]}): {new}건")
+                        break
+            except:
+                continue
+
+    return all_items
 
 def fetch_nikkei225jp() -> list:
     url = "https://nikkei225jp.com/schedule/"
@@ -114,7 +135,6 @@ def fetch_nikkei225jp() -> list:
                           "kessan_time": "", "source": "nikkei225jp"})
     return items
 
-
 def push_to_vps(items):
     r = requests.post(f"{VPS_BASE_URL}/push/kessan",
                       json={"items": items, "secret": VPS_PUSH_SECRET}, timeout=30)
@@ -125,21 +145,15 @@ def push_to_vps(items):
         print(f"  ❌ push 실패: {r.status_code}")
         sys.exit(1)
 
-
 def main():
     now = datetime.now(JST)
     print(f"=== 결산예정 수집 ({now.strftime('%Y-%m-%d %H:%M JST')}) ===")
 
-    print("\n[소스1] kabuyoho.jp 수집 중...")
-    items = fetch_kabuyoho()
+    print("\n[소스1] kabuyoho.jp 날짜별 수집...")
+    items = fetch_kabuyoho_all(days=14)
     print(f"  소계: {len(items)}건")
 
-    if items:
-        for it in items[:5]:
-            print(f"  {it['kessan_date']} [{it['code']}] {it['name']} {it['fiscal_period']}")
-        if len(items) > 5:
-            print(f"  ... 외 {len(items)-5}건")
-    else:
+    if not items:
         print("\n[소스2] nikkei225jp fallback...")
         items = fetch_nikkei225jp()
         print(f"  소계: {len(items)}건")
@@ -147,6 +161,11 @@ def main():
     if not items:
         print("  ⚠️ 데이터 없음")
         sys.exit(0)
+
+    for it in items[:5]:
+        print(f"  {it['kessan_date']} [{it['code']}] {it['name']} {it['fiscal_period']}")
+    if len(items) > 5:
+        print(f"  ... 외 {len(items)-5}건")
 
     push_to_vps(items)
     print("=== 완료 ===")
