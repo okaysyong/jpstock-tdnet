@@ -49,42 +49,35 @@ def main():
     now = datetime.now(JST)
     print(f"=== 결산예정 수집 ({now.strftime('%Y-%m-%d %H:%M JST')}) ===")
 
-    # kabuyoho HTML 저장 후 구조 파악
-    print("\n[kabuyoho 디버그]")
+    # kabuyoho 카드 구조 상세 확인
+    print("\n[kabuyoho 카드 구조 확인]")
     HEADERS_SP = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", "Accept-Language": "ja,en;q=0.9"}
     res = requests.get("https://kabuyoho.jp/sp/calender", headers=HEADERS_SP, timeout=15)
     html = res.text
-    print(f"HTTP {res.status_code}, {len(html)}자")
 
-    # 날짜 패턴
-    for pat in [r'\d{1,2}月\d{1,2}日', r'\d{4}/\d{2}/\d{2}', r'\d{2}/\d{2}\(']:
-        found = re.findall(pat, html)
-        if found:
-            print(f"날짜패턴 '{pat}': {found[:8]}")
+    # 발표일 주변 200자 출력
+    idx = html.find('発表日：')
+    if idx >= 0:
+        print(f"発表日 컨텍스트:\n{repr(html[idx:idx+400])}")
 
-    # 종목코드
-    codes = re.findall(r'[>\s/](\d{4})[A-Z]?[<\s"\']', html)
-    print(f"종목코드 샘플: {list(dict.fromkeys(codes))[:10]}")
+    # 종목코드 주변 구조
+    idx2 = html.find('9601')  # 松竹코드
+    if idx2 >= 0:
+        print(f"\n종목코드 9601 컨텍스트:\n{repr(html[max(0,idx2-200):idx2+200])}")
 
-    # 결산종류
-    for kw in ['1Q','2Q','3Q','本決算','中間','通期','四半期','発表日']:
-        idx = html.find(kw)
-        if idx >= 0:
-            print(f"[{kw}]@{idx}: {repr(html[max(0,idx-60):idx+60])}")
-
-    # HTML 앞부분
-    print("\n--- HTML 1000~2000자 ---")
-    print(repr(html[1000:2000]))
+    # 1Q 주변
+    idx3 = html.find('1Q\n')
+    if idx3 >= 0:
+        print(f"\n1Q 컨텍스트:\n{repr(html[max(0,idx3-300):idx3+100])}")
 
     # nikkei225jp fallback
     print("\n[nikkei225jp fallback]")
     items = fetch_nikkei225jp()
     print(f"수집: {len(items)}건")
     if items:
-        url = f"{VPS_BASE_URL}/push/kessan"
-        r = requests.post(url, json={"items": items, "secret": VPS_PUSH_SECRET}, timeout=30)
-        j = r.json()
-        print(f"✅ push: {j.get('saved',0)}건")
+        r = requests.post(f"{VPS_BASE_URL}/push/kessan",
+                          json={"items": items, "secret": VPS_PUSH_SECRET}, timeout=30)
+        print(f"✅ push: {r.json().get('saved',0)}건")
     print("=== 완료 ===")
 
 if __name__ == "__main__":
