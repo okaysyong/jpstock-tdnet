@@ -2,9 +2,8 @@ name: fetch-kessan
 
 on:
   schedule:
-    # 매일 06:00 JST (= 21:00 UTC 전날)
-    - cron: '0 21 * * 0-4'   # 일~목 (월~금 JST)
-  workflow_dispatch:           # 수동 실행
+    - cron: '0 21 * * 0-4'   # 매일 06:00 JST (일~목)
+  workflow_dispatch:
 
 jobs:
   fetch:
@@ -22,7 +21,6 @@ jobs:
 
       - name: Fetch kessan schedule
         env:
-          JQUANTS_API_KEY:  ${{ secrets.JQUANTS_API_KEY }}
-          VPS_BASE_URL:     ${{ secrets.VPS_URL }}
-          VPS_PUSH_SECRET:  ${{ secrets.VPS_PUSH_SECRET }}
+          VPS_BASE_URL:    ${{ secrets.VPS_URL }}
+          VPS_PUSH_SECRET: ${{ secrets.VPS_PUSH_SECRET }}
         run: python fetch_kessan.py
