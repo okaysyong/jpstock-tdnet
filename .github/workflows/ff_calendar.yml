@@ -10,12 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fetch Events & Push to VPS
+        env:
+          VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
         run: |
           pip install -q beautifulsoup4
           python3 << 'PYEOF'
-          import requests, json, re
+          import requests, json, re, os
           from datetime import datetime, timezone, timedelta
           from bs4 import BeautifulSoup
+
+          VPS_URL = os.environ.get("VPS_NEWS_API_URL", "").rstrip("/")
 
           JST = timezone(timedelta(hours=9))
           year = datetime.now(JST).year
@@ -113,7 +117,7 @@ jobs:
               push_items.append({
                   "title": ev["title"], "currency": ev["currency"],
                   "impact": "High" if ev["stars"] >= 4 else "Medium",
-                  "stars": ev["stars"],  # nikkei225jp 실제 ★ 개수
+                  "stars": ev["stars"],
                   "date": ev["date"], "time": ev["time"],
                   "forecast": ev["forecast"], "previous": ev["previous"],
                   "actual": ev["actual"],
@@ -140,7 +144,10 @@ jobs:
               print(f"  {p['date']} {p['time']} {p['currency']} {p['title'][:28]} | actual={p['actual']}")
 
           if push_items:
-              res = requests.post("https://jpstocklive.com/api/push/ff_events",
-                                  json={"items": push_items}, timeout=30)
-              print(f"VPS push: {res.status_code} | {res.text[:100]}")
+              endpoint = f"{VPS_URL}/push/ff_events"
+              print(f"push → {endpoint}")
+              res = requests.post(endpoint, json={"items": push_items}, timeout=30)
+              print(f"VPS push: {res.status_code} | {res.text[:200]}")
+          else:
+              print("push 없음")
           PYEOF
