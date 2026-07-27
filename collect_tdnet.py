@@ -98,7 +98,7 @@ def push_to_vps(items):
             json={"items": items},
             timeout=30
         )
-        result = r.json()
+        result = r.json() or {}
         print(f"✅ VPS push: {result.get('saved', 0)}건 저장 / {result.get('total', 0)}건 전달")
     except Exception as e:
         print(f"❌ VPS push 실패: {e}")
