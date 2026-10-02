@@ -3,6 +3,7 @@ fetch_kessan.py (kabuyoho PC버전 v2)
 """
 import os, sys, re, requests
 from datetime import datetime, timedelta, timezone
+from collector_parsing import STOCK_CODE_PATTERN
 
 JST = timezone(timedelta(hours=9))
 VPS_BASE_URL    = os.environ.get("VPS_BASE_URL", "https://jpstocklive.com")
@@ -21,17 +22,16 @@ def fetch_kabuyoho_date(date_str: str) -> list:
 
     try:
         res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
-            print(f"  {date_str}: HTTP {res.status_code}")
-            return []
+        res.raise_for_status()
         html = res.text
-    except Exception as e:
-        print(f"  {date_str}: 오류 {e}")
-        return []
+    except requests.RequestException:
+        raise RuntimeError('Earnings calendar download failed') from None
 
     # stocklist 섹션만 추출
     m = re.search(r'id="stocklist">(.*?)(?=</section>|<section)', html, re.DOTALL)
-    section = m.group(1) if m else html
+    if not m:
+        raise RuntimeError('Earnings calendar page format changed')
+    section = m.group(1)
 
     items = []
     seen = set()
@@ -39,11 +39,11 @@ def fetch_kabuyoho_date(date_str: str) -> list:
     # 패턴: bcode=XXXX" title="종목명">
     # 결산종류: 별도 <td> or <span>에 1Q/2Q/3Q/本決算/中間
     # bcode와 결산종류를 카드 단위로 묶어서 파싱
-    card_blocks = re.split(r'(?=bcode=\d{4})', section)
+    card_blocks = re.split(r'(?=bcode=' + STOCK_CODE_PATTERN + r')', section)
 
     for block in card_blocks:
         # 종목코드
-        cm = re.search(r'bcode=(\d{4})', block)
+        cm = re.search(r'bcode=(' + STOCK_CODE_PATTERN + r')', block)
         if not cm:
             continue
         code = cm.group(1)
@@ -78,14 +78,8 @@ def fetch_kabuyoho_date(date_str: str) -> list:
     return items
 
 def push_to_vps(items):
-    r = requests.post(f"{VPS_BASE_URL}/push/kessan",
-                      json={"items": items, "secret": VPS_PUSH_SECRET}, timeout=30)
-    if r.status_code == 200:
-        j = r.json()
-        print(f"  ✅ push: {j.get('saved',0)}건 저장 / {j.get('total',0)}건")
-    else:
-        print(f"  ❌ 실패: {r.status_code}")
-        sys.exit(1)
+    from collector_common import push_json
+    return push_json(VPS_BASE_URL,"/push/kessan",{"items":items})
 
 def main():
     now = datetime.now(JST)

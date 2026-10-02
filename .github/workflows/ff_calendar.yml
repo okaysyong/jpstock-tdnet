@@ -1,153 +1,24 @@
-name: ForexFactory Calendar Push
-
+name: Economic calendar
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '4-59/15 * * * *'
   workflow_dispatch:
-
+permissions:
+  contents: read
+concurrency:
+  group: economic-calendar
+  cancel-in-progress: false
 jobs:
-  push-events:
-    runs-on: ubuntu-latest
+  collect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 8
     steps:
-      - name: Fetch Events & Push to VPS
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.lock.txt
+      - run: python collect_calendar.py
         env:
-          VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
-        run: |
-          pip install -q beautifulsoup4
-          python3 << 'PYEOF'
-          import requests, json, re, os
-          from datetime import datetime, timezone, timedelta
-          from bs4 import BeautifulSoup
-
-          VPS_URL = os.environ.get("VPS_NEWS_API_URL", "").rstrip("/")
-
-          JST = timezone(timedelta(hours=9))
-          year = datetime.now(JST).year
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-              "Accept-Language": "ja,en-US;q=0.9",
-          }
-
-          # ── nikkei225jp 스크래핑 (flag 클래스로 정확한 국가 판단) ──
-          nk_events = []
-          try:
-              r = requests.get("https://nikkei225jp.com/schedule/", headers=headers, timeout=15)
-              print(f"nikkei225jp: {r.status_code}")
-              if r.status_code == 200:
-                  soup = BeautifulSoup(r.text, "html.parser")
-                  main_table = next((t for t in soup.find_all("table") if len(t.find_all("tr")) > 10), None)
-                  if main_table:
-                      current_date = None
-                      for row in main_table.find_all("tr"):
-                          cells = row.find_all(["td","th"])
-                          texts = [c.get_text(strip=True) for c in cells]
-                          if not texts: continue
-                          # 날짜 행
-                          if len(texts) == 1 and re.match(r'\d+/\d+', texts[0]):
-                              m = re.match(r'(\d+)/(\d+)', texts[0])
-                              if m:
-                                  current_date = f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
-                              continue
-                          # 데이터 행
-                          if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]) and current_date:
-                              stars = texts[1].count("★")
-                              if stars < 2: continue
-
-                              # flag 클래스로 국가 판단
-                              span = cells[2].find("span", class_=re.compile(r"flag1-")) if len(cells) > 2 else None
-                              flag = ""
-                              if span:
-                                  for cls in span.get("class", []):
-                                      if cls.startswith("flag1-"):
-                                          flag = cls.replace("flag1-", "")
-                                          break
-
-                              # 포함 기준:
-                              # JP/US → ★2 이상 전부
-                              # EU(ECB) → ★5만 (ECB금리 등)
-                              # 나머지(GB/DE/AU/CN 등) → 제외
-                              if flag == "jp":
-                                  currency = "JPY"
-                              elif flag == "us":
-                                  currency = "USD"
-                              elif flag in ("eu",) and stars >= 5:
-                                  currency = "EUR"
-                              else:
-                                  continue
-
-                              nk_events.append({
-                                  "date": current_date, "time": texts[0],
-                                  "title": texts[2], "actual": texts[3],
-                                  "forecast": texts[4], "previous": texts[5],
-                                  "currency": currency, "stars": stars,
-                              })
-
-                  usd = sum(1 for e in nk_events if e["currency"]=="USD")
-                  jpy = sum(1 for e in nk_events if e["currency"]=="JPY")
-                  eur = sum(1 for e in nk_events if e["currency"]=="EUR")
-                  print(f"파싱: {len(nk_events)}건 (JPY:{jpy} USD:{usd} EUR:{eur})")
-                  for ev in nk_events[:6]:
-                      print(f"  {ev['date']} {ev['time']} {ev['currency']} {ev['title'][:28]} | actual={ev['actual']}")
-
-          except Exception as e:
-              print(f"error: {e}")
-              import traceback; traceback.print_exc()
-
-          # ── ForexFactory JSON (미래 일정 보완) ──
-          ff_items = []
-          for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-                      "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
-              try:
-                  res = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-                  if res.status_code == 200:
-                      ff_items.extend(res.json())
-              except: pass
-          print(f"FF: {len(ff_items)}건")
-
-          def parse_jst(s):
-              try:
-                  dt = datetime.fromisoformat(s).astimezone(JST)
-                  return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
-              except:
-                  return s[:10], "00:00"
-
-          # nikkei225jp 기준 push
-          push_items = []
-          for ev in nk_events:
-              push_items.append({
-                  "title": ev["title"], "currency": ev["currency"],
-                  "impact": "High" if ev["stars"] >= 4 else "Medium",
-                  "stars": ev["stars"],
-                  "date": ev["date"], "time": ev["time"],
-                  "forecast": ev["forecast"], "previous": ev["previous"],
-                  "actual": ev["actual"],
-              })
-
-          # FF에서 nikkei225jp에 없는 USD/JPY High/Medium 보완
-          nk_keys = {(ev["date"], ev["time"][:5]) for ev in nk_events}
-          for ev in ff_items:
-              if ev.get("country") not in ("USD","JPY"): continue
-              if ev.get("impact") not in ("High","Medium"): continue
-              d, t = parse_jst(ev.get("date",""))
-              if (d, t) not in nk_keys:
-                  push_items.append({
-                      "title": ev.get("title",""), "currency": ev.get("country",""),
-                      "impact": ev.get("impact",""), "date": d, "time": t,
-                      "forecast": ev.get("forecast","") or "",
-                      "previous": ev.get("previous","") or "",
-                      "actual": ev.get("actual","") or "",
-                  })
-
-          actual_cnt = sum(1 for p in push_items if p["actual"])
-          print(f"총 push: {len(push_items)}건 (actual: {actual_cnt}건)")
-          for p in push_items[:4]:
-              print(f"  {p['date']} {p['time']} {p['currency']} {p['title'][:28]} | actual={p['actual']}")
-
-          if push_items:
-              endpoint = f"{VPS_URL}/push/ff_events"
-              print(f"push → {endpoint}")
-              res = requests.post(endpoint, json={"items": push_items}, timeout=30)
-              print(f"VPS push: {res.status_code} | {res.text[:200]}")
-          else:
-              print("push 없음")
-          PYEOF
+          VPS_NEWS_API_URL: https://jpstocklive.com
+          VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}

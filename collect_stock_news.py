@@ -16,6 +16,7 @@ GitHub Actions에서 실행 (5분마다)
 import os, re, sys, json, time, hashlib, random, urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
+from collector_parsing import kabutan_articles
 
 try:
     import requests
@@ -152,66 +153,17 @@ def _fetch(url: str, timeout: int = 15, retry: int = 2) -> Optional[str]:
 
 def _parse_news_list(html: str, source: str) -> List[dict]:
     results = []
-    today = _today()
-
-    rows = re.findall(r'<tr[^>]*>.*?</tr>', html, re.DOTALL)
-    for row in rows:
-        title_m = re.search(
-            r'href="(/news/[^"]+)"[^>]*>\s*([^<]{5,120})\s*</a>', row)
-        if not title_m:
-            continue
-        href, title = title_m.group(1), _clean(title_m.group(2))
+    for article in kabutan_articles(html):
+        title = article['title']
         if not title or len(title) < 5 or _excluded(title):
             continue
-
-        time_m = re.search(r'(\d{1,2}:\d{2})', row)
-        time_str = time_m.group(1) if time_m else ""
-
-        code_m = re.search(r'/stock/[^/]+/\?code=(\d{4}[A-Z]?)', row)
-        code = code_m.group(1) if code_m else ""
-        if not code:
-            code_m2 = re.search(r'[?&]code=(\d{4}[A-Z]?)', href)
-            code = code_m2.group(1) if code_m2 else ""
-
+        code = article['code']
         results.append({
-            "id":         _make_id(code or "market", title, today),
-            "code":       code,
-            "company":    "",
-            "title":      title,
-            "url":        f"https://kabutan.jp{href}",
-            "time":       time_str,
-            "date":       today,
-            "source":     source,
-            "importance": _classify(title),
-            "fetched_at": _jst_now(),
+            "id": _make_id(code or "market", title, article['date']),
+            "code": code, "company": "", "title": title,
+            "url": article['url'], "time": article['time'], "date": article['date'],
+            "source": source, "importance": _classify(title), "fetched_at": _jst_now(),
         })
-
-    if len(results) < 5:
-        results = []
-        links = re.findall(
-            r'href="(/news/[^"?]{10,})"[^>]*>\s*([^<]{8,120})\s*</a>', html)
-        seen = set()
-        for href, title in links:
-            title = _clean(title)
-            if not title or title in seen or _excluded(title) or len(title) < 8:
-                continue
-            if title in ["マーケット","株式","ニュース","ランキング","続きを読む"]:
-                continue
-            seen.add(title)
-            code_m = re.search(r'[?&]code=(\d{4}[A-Z]?)', href)
-            code = code_m.group(1) if code_m else ""
-            results.append({
-                "id":         _make_id(code or "market", title, today),
-                "code":       code,
-                "company":    "",
-                "title":      title,
-                "url":        f"https://kabutan.jp{href}",
-                "time":       "",
-                "date":       today,
-                "source":     source,
-                "importance": _classify(title),
-                "fetched_at": _jst_now(),
-            })
     return results
 
 def fetch_market_news_pages(max_pages: int = 15) -> List[dict]:
@@ -311,55 +263,10 @@ def get_top_codes_from_vps() -> List[str]:
     return []
 
 def push_to_vps(news_items: List[dict], max_retry: int = 3) -> bool:
-    """★ 재시도 3회 + 상세 에러 로그"""
-    if not news_items:
-        print("[VPS] 전송할 뉴스 없음")
-        return True
-
-    url = f"{VPS_URL}/push/stock_news"
-    payload = {
-        "secret":     VPS_SECRET,
-        "news":       news_items,
-        "count":      len(news_items),
-        "fetched_at": _jst_now(),
-        "sources": {
-            "market": len([n for n in news_items if n["source"] == "kabutan_market"]),
-            "stock":  len([n for n in news_items if n["source"] == "kabutan_stock"]),
-        }
-    }
-
-    print(f"[VPS] 전송 시도: {url} ({len(news_items)}건)")
-
-    for attempt in range(1, max_retry + 1):
-        try:
-            r = requests.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json", "User-Agent": "JPStock-Collector/2.0"},
-                timeout=30
-            )
-            print(f"[VPS] HTTP {r.status_code} | 응답: {r.text[:200]}")
-            r.raise_for_status()
-            result = r.json()
-            print(f"[VPS] ✅ 전송 완료: {result}")
-            return True
-        except requests.exceptions.JSONDecodeError as e:
-            print(f"[VPS] JSON 파싱 실패 ({attempt}/{max_retry}): {e}")
-            print(f"[VPS] 응답 내용: {r.text[:300] if 'r' in dir() else 'N/A'}")
-        except requests.exceptions.Timeout:
-            print(f"[VPS] 타임아웃 ({attempt}/{max_retry})")
-        except requests.exceptions.ConnectionError as e:
-            print(f"[VPS] 연결 오류 ({attempt}/{max_retry}): {e}")
-        except Exception as e:
-            print(f"[VPS] 기타 오류 ({attempt}/{max_retry}): {type(e).__name__}: {e}")
-
-        if attempt < max_retry:
-            wait = attempt * 5
-            print(f"[VPS] {wait}초 후 재시도...")
-            time.sleep(wait)
-
-    print(f"[VPS] ❌ {max_retry}회 모두 실패")
-    return False
+    from collector_common import push_json
+    if news_items:
+        push_json(VPS_URL,"/push/stock_news",{"news":news_items,"count":len(news_items),"fetched_at":_jst_now()})
+    return True
 
 # ── 메인 ─────────────────────────────────────────────────
 
@@ -401,6 +308,8 @@ def main():
     print(f"  중요도1: {len([n for n in unique if n['importance']==1])}건")
     print(f"  소요시간: {elapsed:.1f}초")
 
+    if not unique:
+        raise RuntimeError('No stock news parsed; verify source availability')
     if not push_to_vps(unique):
         sys.exit(1)
     print("✅ 완료")

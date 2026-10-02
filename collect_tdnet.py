@@ -6,6 +6,7 @@ collect_tdnet.py — GitHub Actions에서 TDnet 공시 수집 → VPS push
 import os, sys, re, requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
+from collector_common import canonical_disclosure_id
 
 JST = timezone(timedelta(hours=9))
 VPS_URL = os.environ.get("VPS_NEWS_API_URL", os.environ.get("VPS_URL", "https://jpstocklive.com"))
@@ -34,21 +35,20 @@ def fetch_tdnet():
     date_str = now_jst.strftime("%Y%m%d")
     items = []
 
-    for page in range(1, 6):
+    for page in range(1, 51):
         url = f"https://www.release.tdnet.info/inbs/I_list_{page:03d}_{date_str}.html"
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            if r.status_code != 200:
-                print(f"  페이지 {page}: HTTP {r.status_code}")
+            if r.status_code == 404:
                 break
+            r.raise_for_status()
             r.encoding = 'utf-8'
             soup = BeautifulSoup(r.text, 'html.parser')
 
             # main-list-table에서 공시 파싱
             main_tbl = soup.find('table', id='main-list-table')
             if not main_tbl:
-                print(f"  페이지 {page}: main-list-table 없음")
-                break
+                raise RuntimeError('TDnet table not found')
 
             page_count = 0
             for row in main_tbl.find_all('tr'):
@@ -67,7 +67,8 @@ def fetch_tdnet():
                 href     = a_tag.get('href', '')
                 link     = f"https://www.release.tdnet.info/inbs/{href}" if href and not href.startswith('http') else href
                 if not code or not title: continue
-                disc_id  = f"{date_str}_{code}_{time_str.replace(':','')}"
+                disc_id = canonical_disclosure_id({'stock_code':code,'title':title,'pdf_url':link,
+                    'disclosed_at':f'{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str}:00'})
                 items.append({
                     "disclosure_id": disc_id,
                     "stock_code": code,
@@ -83,26 +84,15 @@ def fetch_tdnet():
             if page_count < 50:
                 break
         except Exception as e:
-            print(f"⚠️ 페이지 {page}: {e}")
-            break
+            raise RuntimeError(f'TDnet page {page} collection failed') from e
 
     return items
 
 def push_to_vps(items):
+    from collector_common import push_json
     if not items:
-        print("전송할 공시 없음")
-        return
-    try:
-        r = requests.post(
-            f"{VPS_URL}/push/tdnet",
-            json={"items": items},
-            timeout=30
-        )
-        result = r.json() or {}
-        print(f"✅ VPS push: {result.get('saved', 0)}건 저장 / {result.get('total', 0)}건 전달")
-    except Exception as e:
-        print(f"❌ VPS push 실패: {e}")
-        sys.exit(1)
+        return {"ok":True,"saved":0,"total":0}
+    return push_json(VPS_URL,"/push/tdnet",{"items":items})
 
 if __name__ == "__main__":
     print(f"[TDnet] 수집 시작 {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}")

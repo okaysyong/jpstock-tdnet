@@ -13,6 +13,7 @@ import os, re, time, hashlib
 from datetime import datetime, timezone, timedelta
 import requests
 import xml.etree.ElementTree as ET
+from rss_timestamp import publication_time
 
 VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "")
 
@@ -151,26 +152,18 @@ def _parse_rss(xml_text: str, source: str) -> list:
 
             title = _t("title")
             url   = _t("link") or _t("guid")
-            pub   = _t("pubDate") or ""
 
             if not title or not url:
                 continue
 
-            pub_dt = None
-            for fmt in [
-                "%a, %d %b %Y %H:%M:%S %z",
-                "%a, %d %b %Y %H:%M:%S %Z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%SZ",
-            ]:
-                try:
-                    pub_dt = datetime.strptime(pub.strip(), fmt)
-                    break
-                except ValueError:
-                    continue
-
+            pub_dt = publication_time({
+                "published": _t("pubDate") or _t("published")
+                or _t("{http://www.w3.org/2005/Atom}published")
+                or _t("{http://purl.org/dc/elements/1.1/}date"),
+                "updated": _t("updated") or _t("{http://www.w3.org/2005/Atom}updated"),
+            })
             if pub_dt is None:
-                pub_dt = datetime.now(timezone.utc)
+                continue
 
             pub_jst = pub_dt.astimezone(JST)
             pub_str = pub_jst.strftime("%Y-%m-%d %H:%M:%S")
@@ -240,19 +233,10 @@ def fetch_rss(source: str, url: str) -> list:
 
 
 def push_to_vps(items: list) -> dict:
+    from collector_common import push_json
     if not items:
-        print("  전송할 뉴스 없음")
-        return {"saved": 0}
-    try:
-        res = requests.post(
-            f"{VPS_API_URL}/push/news",
-            json={"items": items},
-            timeout=30,
-        )
-        return res.json()
-    except Exception as e:
-        print(f"  VPS push 오류: {e}")
-        return {"saved": 0}
+        return {"ok":True,"saved":0,"total":0}
+    return push_json(VPS_API_URL,"/push/news",{"items":items})
 
 
 def main():
@@ -278,6 +262,8 @@ def main():
     print(f"  MED (score=3): {len([x for x in all_items if x['score']==3])}건")
     print(f"  LOW (score=2): {len([x for x in all_items if x['score']==2])}건")
 
+    if not all_items:
+        raise RuntimeError('No news parsed; verify source availability')
     result = push_to_vps(all_items)
     saved = result.get("saved", 0)
     print(f"VPS 저장: {saved}건")
