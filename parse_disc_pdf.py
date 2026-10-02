@@ -20,19 +20,16 @@ def extract_pdf_text(pdf_url: str) -> str:
     try:
         import io
         from pypdf import PdfReader
-        r = requests.get(pdf_url, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            return ""
-        reader = PdfReader(io.BytesIO(r.content))
+        from safe_pdf import fetch_pdf
+        reader = PdfReader(io.BytesIO(fetch_pdf(pdf_url)))
         text = ""
         for page in reader.pages[:3]:  # 최대 3페이지
             text += page.extract_text() or ""
             if len(text) > 3000:
                 break
         return text[:3000]
-    except Exception as e:
-        print(f"  PDF 파싱 실패: {e}")
-        return ""
+    except Exception:
+        raise RuntimeError('Disclosure PDF retrieval/parsing failed') from None
 
 def extract_key_figures(text: str, title: str) -> str:
     """핵심 수치 추출"""
@@ -74,30 +71,14 @@ def extract_key_figures(text: str, title: str) -> str:
     return " / ".join(content) if content else ""
 
 def get_empty_content_discs():
-    """VPS에서 content가 비어있는 rank≥3 공시 가져오기"""
-    try:
-        r = requests.get(
-            f"{VPS_URL}/tdnet?hours=48&min_rank=3",
-            timeout=10
-        )
-        items = r.json().get("items", [])
-        return [d for d in items if not d.get("content") and d.get("pdf_url")]
-    except Exception as e:
-        print(f"공시 목록 조회 실패: {e}")
-        return []
+    from collector_common import get_json
+    items=get_json(VPS_URL,"/tdnet?hours=48&min_rank=3&limit=500",timeout=15).get("items",[])
+    return [d for d in items if not d.get("content") and d.get("pdf_url")]
 
 def save_content(disclosure_id: str, content: str):
-    """VPS에 content 저장"""
-    try:
-        r = requests.post(
-            f"{VPS_URL}/push/disc_content",
-            json={"disclosure_id": disclosure_id, "content": content, "token": VPS_TOKEN},
-            timeout=10
-        )
-        return r.json().get("ok", False)
-    except Exception as e:
-        print(f"  저장 실패: {e}")
-        return False
+    from collector_common import push_json
+    push_json(VPS_URL,"/push/disc_content",{"disclosure_id":disclosure_id,"content":content})
+    return True
 
 if __name__ == "__main__":
     print(f"[PDF파싱] 시작 {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}")

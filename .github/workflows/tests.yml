@@ -1,0 +1,44 @@
+name: Offline collector tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.lock.txt
+      - run: python -m unittest discover -s tests -v
+  application-check:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 12
+    env:
+      VPS_URL: https://jpstocklive.com
+      VPS_BASE_URL: https://jpstocklive.com
+      VPS_NEWS_API_URL: https://jpstocklive.com
+      VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.lock.txt
+      - name: Verify authenticated VPS endpoint without saving records
+        run: python verify_vps_ingest.py
+      - name: Collect actual RSS news
+        run: python fetch_news_worker.py
+      - name: Collect actual TDnet disclosures
+        run: python collect_tdnet.py
+      - name: Collect actual economic calendar
+        run: python collect_calendar.py
+      - name: Collect actual earnings calendar
+        run: python fetch_kessan.py

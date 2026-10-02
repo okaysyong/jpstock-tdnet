@@ -1,5 +1,6 @@
 import requests, feedparser, json, time, hashlib, os
 from datetime import datetime, timezone, timedelta
+from rss_timestamp import publication_time_jst
 
 JST = timezone(timedelta(hours=9))
 VPS_URL = os.environ.get("VPS_URL", "https://jpstocklive.com")
@@ -72,6 +73,7 @@ headers = {
 
 all_news = []
 seen_uids = set()
+successful_sources = 0
 
 for source, url in RSS_FEEDS:
     try:
@@ -80,6 +82,9 @@ for source, url in RSS_FEEDS:
             print(f"SKIP {source}: {r.status_code}")
             continue
         feed = feedparser.parse(r.text)
+        if feed.bozo and not feed.entries:
+            raise ValueError('RSS response could not be parsed')
+        successful_sources += 1
         count = 0
         for entry in feed.entries[:30]:
             title = (entry.get("title") or "").strip()
@@ -101,11 +106,10 @@ for source, url in RSS_FEEDS:
             uid = hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
             if uid in seen_uids:
                 continue
+            published = publication_time_jst(entry)
+            if published is None:
+                continue
             seen_uids.add(uid)
-            try:
-                published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                published = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
             all_news.append({
                 "uid":          uid,
                 "title":        title,
@@ -129,15 +133,11 @@ print(f"  MED (3): {len([x for x in all_news if x['score']==3])}")
 print(f"  LOW (2): {len([x for x in all_news if x['score']==2])}")
 
 if not all_news:
+    if not successful_sources:
+        raise RuntimeError('All RSS sources failed')
     print("No news")
     exit(0)
 
-try:
-    res = requests.post(
-        f"{VPS_URL}/push/news",
-        json={"items": all_news, "token": VPS_TOKEN},
-        timeout=15,
-    )
-    print(f"VPS: {res.status_code} {res.text[:200]}")
-except Exception as e:
-    print(f"VPS ERR: {e}")
+from collector_common import push_json
+result = push_json(VPS_URL,'/push/news',{'items':all_news},timeout=30)
+print(f"VPS saved={result.get('saved',0)} duplicate={result.get('duplicates',0)}")

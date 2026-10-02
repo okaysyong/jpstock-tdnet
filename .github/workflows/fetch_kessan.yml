@@ -1,26 +1,24 @@
 name: fetch-kessan
-
 on:
   schedule:
-    - cron: '0 21 * * 0-4'   # 매일 06:00 JST (일~목)
+    - cron: '2 21 * * 0-4'
   workflow_dispatch:
-
+permissions:
+  contents: read
+concurrency:
+  group: kessan
+  cancel-in-progress: false
 jobs:
-  fetch:
-    runs-on: ubuntu-latest
+  collect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install requests
-
-      - name: Fetch kessan schedule
+      - run: pip install -r requirements.lock.txt
+      - run: python fetch_kessan.py
         env:
-          VPS_BASE_URL:    ${{ secrets.VPS_URL }}
-          VPS_PUSH_SECRET: ${{ secrets.VPS_PUSH_SECRET }}
-        run: python fetch_kessan.py
+          VPS_BASE_URL: https://jpstocklive.com
+          VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}

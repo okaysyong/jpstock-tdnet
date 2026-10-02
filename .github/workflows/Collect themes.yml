@@ -1,29 +1,24 @@
 name: Collect Stock Themes
-
 on:
   schedule:
-    # 매일 08:30 JST (전날 23:30 UTC) — 장 시작 전
-    - cron: '30 23 * * 0-4'
-  workflow_dispatch:  # 수동 실행 가능
-
+    - cron: '32 23,5,11,17 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: stock-themes
+  cancel-in-progress: false
 jobs:
-  collect-themes:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60  # 225종목 × 2초 = 약 8분, 여유있게 60분
-
+  collect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install requests
-
-      - name: Collect stock themes
+      - run: pip install -r requirements.lock.txt
+      - run: python collect_themes.py
         env:
-          VPS_NEWS_API_URL: ${{ secrets.VPS_NEWS_API_URL }}
-          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
-        run: python collect_themes.py
+          VPS_NEWS_API_URL: https://jpstocklive.com
+          VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}
