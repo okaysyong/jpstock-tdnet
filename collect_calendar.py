@@ -1,5 +1,6 @@
 """Economic calendar collector; import is side-effect free."""
 from collector_common import push_json, event_identity
+from event_normalization import canonical_record_fields
 from datetime import datetime, timedelta, timezone
 import math
 import re
@@ -26,6 +27,8 @@ def normalize_schedule_time(source_date, source_time):
 def normalize_actual(value):
     """Keep reported zero; placeholders are not released economic results."""
     if value is None:
+        return None
+    if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value if math.isfinite(value) else None
@@ -57,7 +60,68 @@ def forexfactory_time(value):
     return event.strftime('%Y-%m-%d'), event.strftime('%H:%M')
 
 
-def main():
+def build_payload(nikkei_events, ff_items, now=None):
+    """One source-consistent record per canonical release, with explicit freshness.
+
+    The weekly FF export normally supplies schedule/forecast/previous only. Missing
+    actual is not zero, and repeated weekly copies cannot create duplicate cards.
+    """
+    now = now or datetime.now(JST)
+    now = now.replace(tzinfo=JST) if now.tzinfo is None else now.astimezone(JST)
+    observed_at = now.astimezone(timezone.utc).isoformat(timespec='seconds')
+    candidates = []
+    for event in nikkei_events:
+        candidates.append({
+            'title': event['title'], 'currency': event['currency'], 'source': 'nikkei225jp',
+            'impact': 'High' if event['stars'] >= 4 else 'Medium', 'stars': event['stars'],
+            'date': event['date'], 'time': event['time'], 'forecast': event.get('forecast'),
+            'previous': event.get('previous'), 'actual': normalize_actual(event.get('actual')),
+            'source_actual_capable': True,
+        })
+    for event in ff_items:
+        if not isinstance(event, dict) or event.get('country') not in ('USD', 'JPY'):
+            continue
+        if event.get('impact') not in ('High', 'Medium'):
+            continue
+        try:
+            day, clock = forexfactory_time(event.get('date', ''))
+        except (ValueError, OverflowError):
+            continue
+        candidates.append({
+            'title': event.get('title', ''), 'currency': event['country'], 'source': 'forexfactory',
+            'impact': event['impact'], 'date': day, 'time': clock,
+            'forecast': event.get('forecast'), 'previous': event.get('previous'),
+            'actual': normalize_actual(event.get('actual')),
+            'source_actual_capable': 'actual' in event,
+        })
+    selected = {}
+    for item in candidates:
+        if not str(item['title']).strip():
+            continue
+        try:
+            due = datetime.fromisoformat(item['date'] + 'T' + item['time']).replace(tzinfo=JST)
+            fields = canonical_record_fields(item, candidates)
+        except (ValueError, TypeError):
+            continue
+        # A scraped old result accidentally paired with a future release cannot
+        # become a result announcement. The original source can update after due.
+        if due > now:
+            item['actual'] = None
+        item.update(fields)
+        item['observed_at'] = observed_at
+        item['result_status'] = ('schedule_only' if not item['source_actual_capable'] else
+                                 'reported' if released_actual(item['actual']) else 'awaiting')
+        key = fields['canonical_id']
+        old = selected.get(key)
+        priority = (released_actual(item['actual']), item['source'] == 'nikkei225jp')
+        old_priority = (released_actual(old['actual']), old['source'] == 'nikkei225jp') if old else None
+        # Do not mix conflicting forecasts/previous values from different providers.
+        if old is None or priority > old_priority:
+            selected[key] = item
+    return sorted(selected.values(), key=lambda item: (item['date'], item['time'], item['canonical_id']))
+
+
+def main(include_forexfactory=True):
     import requests, json, re, os
     from datetime import datetime, timezone, timedelta
     from bs4 import BeautifulSoup
@@ -153,50 +217,26 @@ def main():
     
     # ── ForexFactory JSON (미래 일정 보완) ──
     ff_items = []
-    for url in ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-                "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]:
+    ff_urls = ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+               "https://nfs.faireconomy.media/ff_calendar_nextweek.json"] if include_forexfactory else []
+    for url in ff_urls:
         try:
             res = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
             if res.status_code == 200:
-                ff_items.extend(res.json())
-                successful_sources += 1
+                payload = res.json()
+                if isinstance(payload, list):
+                    ff_items.extend(item for item in payload if isinstance(item, dict))
+                    successful_sources += 1
         except: pass
     print(f"FF: {len(ff_items)}건")
     
-    # nikkei225jp 기준 push
-    push_items = []
-    for ev in nk_events:
-        push_items.append({
-            "title": ev["title"], "currency": ev["currency"],
-            "source": "nikkei225jp",
-            "impact": "High" if ev["stars"] >= 4 else "Medium",
-            "stars": ev["stars"],
-            "date": ev["date"], "time": ev["time"],
-            "forecast": ev["forecast"], "previous": ev["previous"],
-            "actual": ev["actual"],
-        })
-    
-    # FF에서 nikkei225jp에 없는 USD/JPY High/Medium 보완
-    nk_keys = {event_identity(ev["date"], ev["time"], ev["currency"], ev["title"]) for ev in nk_events}
-    for ev in ff_items:
-        if ev.get("country") not in ("USD","JPY"): continue
-        if ev.get("impact") not in ("High","Medium"): continue
-        try:
-            d, t = forexfactory_time(ev.get("date",""))
-        except (ValueError, OverflowError):
-            continue
-        if event_identity(d,t,ev.get("country",""),ev.get("title","")) not in nk_keys:
-            push_items.append({
-                "title": ev.get("title",""), "currency": ev.get("country",""),
-                "source": "forexfactory",
-                "impact": ev.get("impact",""), "date": d, "time": t,
-                "forecast": ev.get("forecast"),
-                "previous": ev.get("previous"),
-                "actual": normalize_actual(ev.get("actual")),
-            })
+    push_items = build_payload(nk_events, ff_items, now=datetime.now(JST))
     
     actual_cnt = sum(1 for p in push_items if released_actual(p["actual"]))
     print(f"총 push: {len(push_items)}건 (actual: {actual_cnt}건)")
+    print(f"calendar observed_at={datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+          f"schedule_only={sum(p['result_status']=='schedule_only' for p in push_items)} "
+          f"ff_schedule_fetch={include_forexfactory}")
     for p in push_items[:4]:
         print(f"  {p['date']} {p['time']} {p['currency']} {p['title'][:28]} | actual={p['actual']}")
     
@@ -211,5 +251,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--skip-forexfactory', action='store_true', help='Fetch only result-capable Nikkei; FF weekly exports are schedule supplements.')
+    main(include_forexfactory=not parser.parse_args().skip_forexfactory)
 

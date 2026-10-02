@@ -17,11 +17,8 @@ def canonical_disclosure_id(item):
 
 
 def event_identity(date, clock, country, title):
-    value=''.join(c for c in unicodedata.normalize('NFKC',title).casefold().strip() if c.isalnum())
-    aliases={'nonfarmemploymentchange':'nonfarmpayrolls','非農業部門雇用者数':'nonfarmpayrolls','失業率':'unemploymentrate','新規失業保険申請件数':'unemploymentclaims'}
-    countries={'USD':'US','JPY':'JP','EUR':'EU','GBP':'GB','AUD':'AU','CNY':'CN'}
-    raw='|'.join((date,clock[:5],countries.get(country,country),aliases.get(value,value)))
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
+    from event_normalization import canonical_key
+    return canonical_key(date, clock, country, title)
 
 
 def push_json(base_url,path,payload,session=None,timeout=30,token=None):

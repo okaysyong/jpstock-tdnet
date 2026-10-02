@@ -1,7 +1,12 @@
 name: Economic calendar
 on:
   schedule:
-    - cron: '4-59/15 * * * *'
+    # Result-capable Nikkei: retain existing 15-minute cadence.
+    # GitHub scheduled jobs may be delayed; this is not a release-time SLA.
+    - cron: '4 * * * *'
+    # Weekly FF JSON is a schedule supplement (observed schema has no actual).
+    # Download it only on the hourly :04 run, not on every result refresh.
+    - cron: '19,34,49 * * * *'
   workflow_dispatch:
 permissions:
   contents: read
@@ -18,7 +23,13 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.lock.txt
-      - run: python collect_calendar.py
+      - run: |
+          if [ "$CALENDAR_SCHEDULE" = '19,34,49 * * * *' ]; then
+            python collect_calendar.py --skip-forexfactory
+          else
+            python collect_calendar.py
+          fi
         env:
+          CALENDAR_SCHEDULE: ${{ github.event.schedule }}
           VPS_NEWS_API_URL: https://jpstocklive.com
           VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}

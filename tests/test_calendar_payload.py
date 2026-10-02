@@ -50,7 +50,8 @@ FF_FIXTURE = [
 class FrozenDateTime(datetime):
     @classmethod
     def now(cls, tz=None):
-        now = cls(2026, 10, 2, 3, 0, tzinfo=timezone.utc)
+        # Reported values in this fixture are valid only after their release.
+        now = cls(2026, 10, 9, 3, 0, tzinfo=timezone.utc)
         return now.astimezone(tz) if tz else now.replace(tzinfo=None)
 
 
@@ -126,6 +127,29 @@ class CalendarPayloadTests(unittest.TestCase):
                 self.assertRegex(item['currency'], r'^[A-Z]{3}$')
                 if 'stars' in item:
                     self.assertTrue(1 <= item['stars'] <= 5)
+
+    def test_result_refresh_can_skip_schedule_only_ff_downloads(self):
+        import requests
+        page = types.SimpleNamespace(status_code=200, text=NIKKEI_FIXTURE)
+        captured = []
+        def capture(base, path, payload, **kwargs):
+            captured.extend(payload['items'])
+            return {'ok': True, 'saved': len(payload['items'])}
+        with patch.object(requests, 'get', return_value=page) as get, \
+             patch.object(calendar, 'push_json', side_effect=capture), \
+             patch('datetime.datetime', FrozenDateTime), \
+             contextlib.redirect_stdout(io.StringIO()):
+            calendar.main(include_forexfactory=False)
+        self.assertEqual(get.call_count, 1)
+        self.assertTrue(all(item['source'] == 'nikkei225jp' for item in captured))
+        self.assertTrue(all(item['source_actual_capable'] for item in captured))
+
+    def test_schedule_cadence_unchanged_and_ff_is_hourly(self):
+        workflow = (ROOT / '.github/workflows/ff_calendar.yml').read_text(encoding='utf-8')
+        self.assertIn("cron: '4 * * * *'", workflow)
+        self.assertIn("cron: '19,34,49 * * * *'", workflow)
+        self.assertIn('python collect_calendar.py --skip-forexfactory', workflow)
+        self.assertIn('CALENDAR_SCHEDULE: ${{ github.event.schedule }}', workflow)
 
 
 if __name__ == '__main__':
