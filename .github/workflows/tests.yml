@@ -58,10 +58,20 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.lock.txt
       - name: Collect actual Kabutan news
+        id: kabutan_direct
+        continue-on-error: true
         run: python collect_kabutan.py
+      - name: Verify recent VPS execution after direct Kabutan collection failed
+        if: steps.kabutan_direct.outcome == 'failure'
+        run: python verify_vps_source.py --source kabutan
       - name: Collect actual source-dated stock news
+        id: stock_news_direct
+        continue-on-error: true
         if: always()
         run: python collect_stock_news.py
+      - name: Verify recent VPS execution after direct stock-news collection failed
+        if: always() && steps.stock_news_direct.outcome == 'failure'
+        run: python verify_vps_source.py --source kabutan
   theme-check:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: tests
@@ -77,6 +87,8 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.lock.txt
       - name: Collect and save a bounded actual stock-theme sample
+        id: theme_direct
+        continue-on-error: true
         run: |
           python - <<'PY'
           import collect_themes as source
@@ -88,3 +100,6 @@ jobs:
           result = source.push_to_vps(items)
           print('Theme sample collected=' + str(len(items)) + ', saved=' + str(result.get('saved', 0)))
           PY
+      - name: Verify recent VPS execution after direct theme collection failed
+        if: steps.theme_direct.outcome == 'failure'
+        run: python verify_vps_source.py --source push_themes

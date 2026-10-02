@@ -19,7 +19,15 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.lock.txt
-      - run: python collect_stock_news.py
+      - name: Collect directly from GitHub
+        id: direct
+        continue-on-error: true
+        run: python collect_stock_news.py
         env:
           VPS_URL: https://jpstocklive.com
           VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}
+      - name: Verify recent VPS execution after direct collection failed
+        if: steps.direct.outcome == 'failure'
+        run: python verify_vps_source.py --source kabutan
+        env:
+          VPS_URL: https://jpstocklive.com
