@@ -6,6 +6,7 @@ GitHub Actions에서 실행 — 카부탄에서 종목 테마 수집 → VPS /pu
 import os, re, time, json, requests, sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from bs4 import BeautifulSoup
 
 JST = ZoneInfo("Asia/Tokyo")
 VPS_API_URL = os.environ.get("VPS_NEWS_API_URL", "")
@@ -29,11 +30,23 @@ def fetch_kabutan_themes(code: str) -> list:
     try:
         r = SESSION.get(url, timeout=15)
         r.raise_for_status()
-        html = r.text
-        theme_links = re.findall(
-            r'href="/themes/\?(?:theme|industry)=[^"]*"[^>]*>([^<]{2,20})<',
-            html
-        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        heading = soup.select_one('#kobetsu')
+        if heading is None or not re.search(r'\(' + re.escape(code) + r'\)', heading.get_text(' ', strip=True)):
+            raise ValueError('Stock page identity could not be verified')
+        theme_row = next((row for row in soup.select('tr')
+                          if row.find('th') is not None and row.find('th').get_text(strip=True) == 'テーマ'), None)
+        if theme_row is None or theme_row.find('td') is None:
+            raise ValueError('Stock theme section was not found')
+        cell = theme_row.find('td')
+        anchors = [a for a in cell.select('a[href]') if a['href'].startswith('/themes/?theme=')]
+        if not anchors:
+            # A verified empty field is valid. Unknown HTML must never clear
+            # existing themes and mark a security complete for seven days.
+            if cell.get_text(' ', strip=True) in ('', '-', '－', '―', '—', 'なし', '該当なし'):
+                return []
+            raise ValueError('Stock theme section could not be parsed')
+        theme_links = [a.get_text(' ', strip=True) for a in anchors]
         seen = set()
         result = []
         skip = {"TOPIXコア30","TOPIX100","日経225","JPX日経400",

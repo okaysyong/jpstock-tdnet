@@ -107,12 +107,51 @@ class ArticleSources(unittest.TestCase):
         self.assertEqual(items[0]['published_at'], '2026-10-01 15:00:00')
 
     def test_earnings_schedule_includes_alphanumeric_security_code(self):
-        html = '''<section id="stocklist"><a href="/stock?bcode=285A" title="日本の新会社">詳細</a><span>2Q</span>
-          <a href="/stock?bcode=7203" title="トヨタ">詳細</a><span>本決算</span></section>'''
+        html = '''<section class="result" id = "stocklist"><table>
+          <tr><th>銘柄名</th><th>決算発表(予定)</th></tr>
+          <tr><td><a href="/reportTop?bcode=285A"><p>日本の新会社</p></a></td>
+            <td>2026/10/02</td><td>2026/09</td><td>2Q</td></tr>
+          <tr><td><a href="/reportTop?bcode=7203"><p>トヨタ</p></a></td>
+            <td>2026/10/02</td><td>2026/09</td><td>本決算</td></tr>
+          </table></section>'''
         with patch.object(kessan.requests, 'get', return_value=Page(html)):
             items = kessan.fetch_kabuyoho_date('2026-10-02')
         self.assertEqual([item['code'] for item in items], ['285A', '7203'])
         self.assertEqual([item['fiscal_period'] for item in items], ['2Q', '本決算'])
+
+    def test_kabutan_earnings_document_and_data_code_keep_source_day(self):
+        html = '''<table class="s_news_list"><tr>
+          <td><time datetime="2026-10-01T15:30:00+09:00">10/01 15:30</time></td>
+          <td data-code="646A">決算</td>
+          <td><a href="/news/?&amp;b=k202610010011">新会社、経常利益を上方修正</a></td>
+          </tr></table>'''
+        raw = stock_news._parse_news_list(html, 'kabutan_stock')
+        self.assertEqual((raw[0]['code'], raw[0]['date'], raw[0]['time']),
+                         ('646A', '2026-10-01', '15:30'))
+        with patch.object(stock_news, '_fetch', return_value=html) as fetch, \
+                patch.object(stock_news.time, 'sleep'), \
+                patch.object(stock_news, 'NK225_CODES', {'646A'}):
+            items = stock_news.fetch_stock_news_pages(max_pages=1)
+        self.assertEqual(len(items), 1)
+        fetch.assert_called_once_with('https://kabutan.jp/news/?page=1')
+
+    def test_valid_earnings_articles_outside_watchlist_are_a_normal_empty_result(self):
+        html = OLD_ARTICLE.replace('<table class="s_news_list">', '<table class="s_news_list">')
+        with patch.object(stock_news, '_fetch', return_value=html), \
+                patch.object(stock_news.time, 'sleep'), \
+                patch.object(stock_news, 'NK225_CODES', {'7203'}):
+            self.assertEqual(stock_news.fetch_stock_news_pages(max_pages=1), [])
+
+    def test_unknown_stock_news_page_or_article_format_is_a_failure(self):
+        invalid = (
+            None,
+            '<html>Verify you are human</html>',
+            '<table class="s_news_list"><tr><td><a href="/news/changed">決算が上方修正</a></td></tr></table>',
+        )
+        for html in invalid:
+            with self.subTest(html=html), patch.object(stock_news, '_fetch', return_value=html), \
+                    self.assertRaises(RuntimeError):
+                stock_news.fetch_stock_news_pages(max_pages=1)
 
 
 if __name__ == '__main__':

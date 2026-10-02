@@ -11,6 +11,8 @@ STOCK_CODE_PATTERN = r'(?:[0-9]{3}[A-Z]|[0-9]{4})(?![0-9A-Z])'
 def stock_code(value):
     """Japanese listed security codes contain four characters."""
     match = re.search(r'(?:[?&]code=|/stock/|[?&]bcode=)(' + STOCK_CODE_PATTERN + ')', value)
+    if not match:
+        match = re.search(r'data-code=[\"\'](' + STOCK_CODE_PATTERN + r')[\"\']', value)
     return match.group(1) if match else ''
 
 
@@ -26,7 +28,7 @@ def article_timestamp(container, href=''):
             continue
     # Kabutan document identifiers include YYYYMMDD. The suffix is a sequence,
     # not HHMM, so a clock can come only from the same article row.
-    dated = re.search(r'[?&]b=n([0-9]{8})[0-9]*(?:&|$)', unquote(href))
+    dated = re.search(r'[?&]b=[nk]([0-9]{8})[0-9]*(?:&|$)', unquote(href))
     if not dated:
         return None
     clock = re.search(r'(?<![0-9])([0-9]{1,2}):([0-9]{2})(?![0-9])', container.get_text(' ', strip=True))
@@ -43,7 +45,7 @@ def kabutan_articles(html):
     seen = set()
     for row in soup.select('tr'):
         anchor = next((a for a in row.select('a[href]') if a['href'].startswith('/news/')
-                       and re.search(r'[?&]b=n[0-9]{8}', a['href'])), None)
+                       and re.search(r'[?&]b=[nk][0-9]{8}', a['href'])), None)
         if anchor is None:
             continue
         title = anchor.get_text(' ', strip=True)

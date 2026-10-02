@@ -3,6 +3,8 @@ fetch_kessan.py (kabuyoho PC버전 v2)
 """
 import os, sys, re, requests
 from datetime import datetime, timedelta, timezone
+import unicodedata
+from bs4 import BeautifulSoup
 from collector_parsing import STOCK_CODE_PATTERN
 
 JST = timezone(timedelta(hours=9))
@@ -15,58 +17,58 @@ HEADERS = {
     "Referer": "https://kabuyoho.jp/",
 }
 
-def fetch_kabuyoho_date(date_str: str) -> list:
-    yyyymmdd = date_str.replace("-", "")
-    yyyymm   = date_str[:7].replace("-", "")
-    url = f"https://kabuyoho.jp/calender?lst={yyyymmdd}&publ=off&ym={yyyymm}&sett=4"
-
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        res.raise_for_status()
-        html = res.text
-    except requests.RequestException:
-        raise RuntimeError('Earnings calendar download failed') from None
-
-    # stocklist 섹션만 추출
-    m = re.search(r'id="stocklist">(.*?)(?=</section>|<section)', html, re.DOTALL)
-    if not m:
+def parse_kabuyoho_html(html: str, date_str: str) -> list:
+    """Read the selected date's earnings table, never navigation or other stock lists."""
+    datetime.strptime(date_str, '%Y-%m-%d')
+    soup = BeautifulSoup(html, 'html.parser')
+    container = soup.select_one('#stocklist') or soup.select_one('section.cldr_today')
+    if container is None:
         raise RuntimeError('Earnings calendar page format changed')
-    section = m.group(1)
-
+    tables = [container] if container.name == 'table' else container.find_all('table')
+    table = next((candidate for candidate in tables
+                  if '銘柄' in ' '.join(th.get_text(' ', strip=True)
+                                        for th in candidate.find_all('th'))
+                  and '決算' in ' '.join(th.get_text(' ', strip=True)
+                                        for th in candidate.find_all('th'))), None)
+    if table is None:
+        raise RuntimeError('Earnings calendar page format changed')
     items = []
     seen = set()
-
-    # 패턴: bcode=XXXX" title="종목명">
-    # 결산종류: 별도 <td> or <span>에 1Q/2Q/3Q/本決算/中間
-    # bcode와 결산종류를 카드 단위로 묶어서 파싱
-    card_blocks = re.split(r'(?=bcode=' + STOCK_CODE_PATTERN + r')', section)
-
-    for block in card_blocks:
-        # 종목코드
-        cm = re.search(r'bcode=(' + STOCK_CODE_PATTERN + r')', block)
-        if not cm:
+    for row in table.find_all('tr'):
+        cells = row.find_all('td', recursive=False)
+        if not cells:
             continue
-        code = cm.group(1)
-
-        # 종목명: title 속성 또는 <p> 태그
-        nm = re.search(r'title="([^"]{2,20})"', block)
-        if not nm:
-            nm = re.search(r'<p>([^<]{2,20})</p>', block)
-        name = nm.group(1).strip() if nm else ""
-        if not name:
+        anchor = next((a for a in cells[0].find_all('a', href=True)
+                       if re.search(r'[?&]bcode=(' + STOCK_CODE_PATTERN + ')', a['href'])), None)
+        if anchor is None:
             continue
-
-        # 결산종류
-        km = re.search(r'(1Q|2Q|3Q|4Q|本決算|中間|通期)', block)
-        ktype = km.group(1) if km else ""
-
+        if len(cells) < 4:
+            raise RuntimeError('Earnings calendar row format changed')
+        code = re.search(r'[?&]bcode=(' + STOCK_CODE_PATTERN + ')', anchor['href']).group(1)
+        company = anchor.find('p')
+        name = company.get_text(' ', strip=True) if company else str(anchor.get('title') or '').strip()
+        announced = re.search(r'(?<![0-9])([0-9]{4})[/-]([0-9]{1,2})[/-]([0-9]{1,2})(?![0-9])',
+                              cells[1].get_text(' ', strip=True))
+        if not name or announced is None:
+            raise RuntimeError('Earnings calendar row format changed')
+        try:
+            source_date = datetime(*map(int, announced.groups())).strftime('%Y-%m-%d')
+        except ValueError:
+            raise RuntimeError('Invalid earnings calendar source date') from None
+        if source_date != date_str:
+            continue
+        # Only the scheduled period column counts. Later profit columns show prior quarters.
+        period = unicodedata.normalize('NFKC', cells[3].get_text(' ', strip=True))
+        period = '本決算' if period == '本' else period
+        match = re.search(r'(1Q|2Q|3Q|4Q|本決算|中間|通期)', period)
+        ktype = match.group(1) if match else ''
         key = f"{code}_{date_str}"
         if key in seen:
             continue
         seen.add(key)
 
         items.append({
-            "code":          code[:4],
+            "code":          code,
             "name":          name[:20],
             "market":        "",
             "fiscal_period": ktype,
@@ -76,6 +78,19 @@ def fetch_kabuyoho_date(date_str: str) -> list:
         })
 
     return items
+
+
+def fetch_kabuyoho_date(date_str: str) -> list:
+    datetime.strptime(date_str, '%Y-%m-%d')
+    yyyymmdd = date_str.replace("-", "")
+    yyyymm = date_str[:7].replace("-", "")
+    url = f"https://kabuyoho.jp/calender?lst={yyyymmdd}&publ=off&ym={yyyymm}&sett=4"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        res.raise_for_status()
+    except requests.RequestException:
+        raise RuntimeError('Earnings calendar download failed') from None
+    return parse_kabuyoho_html(res.text, date_str)
 
 def push_to_vps(items):
     from collector_common import push_json

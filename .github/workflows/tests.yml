@@ -1,4 +1,4 @@
-name: Offline collector tests
+name: Collector tests and VPS verification
 on:
   push:
   pull_request:
@@ -42,3 +42,49 @@ jobs:
         run: python collect_calendar.py
       - name: Collect actual earnings calendar
         run: python fetch_kessan.py
+  market-news-check:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 12
+    env:
+      VPS_URL: https://jpstocklive.com
+      VPS_NEWS_API_URL: https://jpstocklive.com
+      VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.lock.txt
+      - name: Collect actual Kabutan news
+        run: python collect_kabutan.py
+      - name: Collect actual source-dated stock news
+        if: always()
+        run: python collect_stock_news.py
+  theme-check:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    env:
+      VPS_NEWS_API_URL: https://jpstocklive.com
+      VPS_PUSH_TOKEN: ${{ secrets.VPS_PUSH_TOKEN || secrets.VPS_PUSH_SECRET || secrets.VPS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.lock.txt
+      - name: Collect and save a bounded actual stock-theme sample
+        run: |
+          python - <<'PY'
+          import collect_themes as source
+          available = set(source.get_all_codes_from_vps())
+          codes = [code for code in ('7203', '6758', '9984') if code in available]
+          if not codes:
+              raise RuntimeError('Theme validation sample is missing from stock master')
+          items = [{'code': code, 'themes': source.fetch_kabutan_themes(code), 'source': 'kabutan'} for code in codes]
+          result = source.push_to_vps(items)
+          print('Theme sample collected=' + str(len(items)) + ', saved=' + str(result.get('saved', 0)))
+          PY

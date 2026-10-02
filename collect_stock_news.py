@@ -17,6 +17,7 @@ import os, re, sys, json, time, hashlib, random, urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from collector_parsing import kabutan_articles
+from bs4 import BeautifulSoup
 
 try:
     import requests
@@ -195,45 +196,31 @@ def fetch_market_news_pages(max_pages: int = 15) -> List[dict]:
     return all_items
 
 def fetch_stock_news_pages(max_pages: int = 5) -> List[dict]:
+    """Canonical earnings list; each article supplies its date and security."""
     print(f"[카부탄] 종목뉴스 목록 수집 중... (최대 {max_pages}페이지)")
     all_items = []
     seen_ids = set()
-
-    categories = [
-        ("0",  "결산/업적"),
-        ("2",  "M&A/TOB"),
-        ("3",  "増資/自社株"),
-        ("6",  "株主総会"),
-        ("10", "テーマ株"),
-    ]
-
-    for cat_id, cat_name in categories:
-        cat_count = 0
-        for page in range(1, max_pages + 1):
-            url = f"https://kabutan.jp/news/?category={cat_id}&page={page}"
-            html = _fetch(url)
-            if not html:
-                break
-
-            items = _parse_news_list(html, "kabutan_stock")
-            filtered = []
-            for x in items:
-                if x["id"] in seen_ids:
-                    continue
-                if x["code"] and x["code"] not in NK225_CODES:
-                    continue
-                seen_ids.add(x["id"])
-                x["source"] = "kabutan_stock"
-                filtered.append(x)
-
-            all_items.extend(filtered)
-            cat_count += len(filtered)
-
-            if len(items) == 0:
-                break
-            time.sleep(random.uniform(2, 4))
-
-        print(f"  [{cat_name}]: {cat_count}건")
+    for page in range(1, max_pages + 1):
+        url = f"https://kabutan.jp/news/?page={page}"
+        html = _fetch(url)
+        if not html:
+            raise RuntimeError(f'Stock news page {page} download failed')
+        soup = BeautifulSoup(html, 'html.parser')
+        news_tables = soup.select('table.s_news_list')
+        if not news_tables:
+            raise RuntimeError('Stock news page format could not be verified')
+        if any(a['href'].startswith('/news/') for table in news_tables for a in table.select('a[href]')) and not list(kabutan_articles(html)):
+            raise RuntimeError('Stock news article dates could not be verified')
+        items = _parse_news_list(html, "kabutan_stock")
+        for item in items:
+            if not item["code"] or item["code"] not in NK225_CODES or item["id"] in seen_ids:
+                continue
+            seen_ids.add(item["id"])
+            all_items.append(item)
+        print(f"  페이지 {page}: 원문 {len(items)}건, 감시 종목 누계 {len(all_items)}건")
+        if not items:
+            break
+        time.sleep(random.uniform(2, 4))
 
     print(f"  → 종목뉴스 합계 {len(all_items)}건")
     return all_items

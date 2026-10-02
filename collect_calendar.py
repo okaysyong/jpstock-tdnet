@@ -1,5 +1,60 @@
 """Economic calendar collector; import is side-effect free."""
 from collector_common import push_json, event_identity
+from datetime import datetime, timedelta, timezone
+import math
+import re
+import unicodedata
+
+
+JST = timezone(timedelta(hours=9))
+
+
+def normalize_schedule_time(source_date, source_time):
+    """Nikkei's 27:00 on a source date means 03:00 on the next JST date."""
+    clock = unicodedata.normalize('NFKC', str(source_time)).strip()
+    match = re.fullmatch(r'(\d{1,2}):(\d{2})', clock)
+    if match is None:
+        raise ValueError('Invalid economic event clock')
+    hour, minute = map(int, match.groups())
+    if hour > 47 or minute > 59:
+        raise ValueError('Invalid economic event clock')
+    day = datetime.strptime(source_date, '%Y-%m-%d')
+    event = day + timedelta(hours=hour, minutes=minute)
+    return event.strftime('%Y-%m-%d'), event.strftime('%H:%M')
+
+
+def normalize_actual(value):
+    """Keep reported zero; placeholders are not released economic results."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value if math.isfinite(value) else None
+    text = unicodedata.normalize('NFKC', str(value)).strip()
+    if not text or re.fullmatch(r'[-‐‑‒–—―ー−]+', text):
+        return None
+    if text.casefold() in {'未発表', '未公表', '未定', '発表前', 'n/a', 'na', 'null', 'none',
+                           'tba', 'pending', 'not released', 'not yet released'}:
+        return None
+    return text
+
+
+def normalize_stars(value):
+    # The VPS accepts importance from 1 through 5. Repeated star markup cannot exceed it.
+    return min(5, max(1, int(value)))
+
+
+def released_actual(value):
+    return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
+
+def forexfactory_time(value):
+    if not isinstance(value, str):
+        raise ValueError('Invalid economic event timestamp')
+    event = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if event.tzinfo is None or event.utcoffset() is None:
+        raise ValueError('Economic event timestamp has no timezone')
+    event = event.astimezone(JST)
+    return event.strftime('%Y-%m-%d'), event.strftime('%H:%M')
 
 
 def main():
@@ -48,8 +103,13 @@ def main():
                         continue
                     # 데이터 행
                     if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]) and current_date:
-                        stars = texts[1].count("★")
-                        if stars < 2: continue
+                        source_stars = texts[1].count("★")
+                        if source_stars < 2: continue
+                        stars = normalize_stars(source_stars)
+                        try:
+                            event_date, event_time = normalize_schedule_time(current_date, texts[0])
+                        except ValueError:
+                            continue
     
                         # flag 클래스로 국가 판단
                         span = cells[2].find("span", class_=re.compile(r"flag1-")) if len(cells) > 2 else None
@@ -74,8 +134,8 @@ def main():
                             continue
     
                         nk_events.append({
-                            "date": current_date, "time": texts[0],
-                            "title": texts[2], "actual": texts[3],
+                            "date": event_date, "time": event_time,
+                            "title": texts[2], "actual": normalize_actual(texts[3]),
                             "forecast": texts[4], "previous": texts[5],
                             "currency": currency, "stars": stars,
                         })
@@ -103,18 +163,12 @@ def main():
         except: pass
     print(f"FF: {len(ff_items)}건")
     
-    def parse_jst(s):
-        try:
-            dt = datetime.fromisoformat(s).astimezone(JST)
-            return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
-        except:
-            raise ValueError("Invalid economic event timestamp")
-    
     # nikkei225jp 기준 push
     push_items = []
     for ev in nk_events:
         push_items.append({
             "title": ev["title"], "currency": ev["currency"],
+            "source": "nikkei225jp",
             "impact": "High" if ev["stars"] >= 4 else "Medium",
             "stars": ev["stars"],
             "date": ev["date"], "time": ev["time"],
@@ -128,19 +182,20 @@ def main():
         if ev.get("country") not in ("USD","JPY"): continue
         if ev.get("impact") not in ("High","Medium"): continue
         try:
-            d, t = parse_jst(ev.get("date",""))
-        except ValueError:
+            d, t = forexfactory_time(ev.get("date",""))
+        except (ValueError, OverflowError):
             continue
         if event_identity(d,t,ev.get("country",""),ev.get("title","")) not in nk_keys:
             push_items.append({
                 "title": ev.get("title",""), "currency": ev.get("country",""),
+                "source": "forexfactory",
                 "impact": ev.get("impact",""), "date": d, "time": t,
                 "forecast": ev.get("forecast"),
                 "previous": ev.get("previous"),
-                "actual": ev.get("actual"),
+                "actual": normalize_actual(ev.get("actual")),
             })
     
-    actual_cnt = sum(1 for p in push_items if p["actual"])
+    actual_cnt = sum(1 for p in push_items if released_actual(p["actual"]))
     print(f"총 push: {len(push_items)}건 (actual: {actual_cnt}건)")
     for p in push_items[:4]:
         print(f"  {p['date']} {p['time']} {p['currency']} {p['title'][:28]} | actual={p['actual']}")
