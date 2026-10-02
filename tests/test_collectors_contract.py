@@ -49,6 +49,50 @@ class CollectorTests(unittest.TestCase):
         for url in ('http://example.test','https://name:pass@example.test','https://example.test/?token=x'):
             with self.subTest(url=url),self.assertRaises(RuntimeError):common.push_json(url,'/push/news',{},session=FakeHTTP(),token='test-only')
 
+    @patch.object(common.time,'sleep')
+    def test_http_diagnostics_report_only_status_and_stop_on_client_errors(self,sleep):
+        private='credential-header-body-URL-MUST-NOT-APPEAR'
+        class PrivateReply(Reply):
+            def raise_for_status(self):
+                raise requests.HTTPError(private,response=self)
+        for status in (401,404,422):
+            http=FakeHTTP(PrivateReply({'private':private},status))
+            with self.subTest(status=status),self.assertRaises(RuntimeError) as caught:
+                common.push_json('https://example.test','/push/news',{},session=http,token=private)
+            self.assertEqual(str(caught.exception),
+                f'VPS ingestion failed after validation/retry (HTTP {status})')
+            self.assertNotIn(private,str(caught.exception))
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertEqual(len(http.calls),1)
+        sleep.assert_not_called()
+
+    @patch.object(common.time,'sleep')
+    def test_network_diagnostics_do_not_leak_or_reuse_an_old_response_status(self,sleep):
+        private='credential-header-body-URL-MUST-NOT-APPEAR'
+        class BrokenHTTP:
+            def __init__(self):self.calls=0
+            def post(self,*args,**kwargs):
+                self.calls+=1
+                if self.calls==1:return Reply({},503)
+                raise requests.ConnectionError(private)
+        http=BrokenHTTP()
+        with self.assertRaises(RuntimeError) as caught:
+            common.push_json('https://example.test','/push/news',{},session=http,token=private)
+        self.assertEqual(str(caught.exception),
+            'VPS ingestion failed after validation/retry (HTTP unavailable)')
+        self.assertNotIn(private,str(caught.exception))
+        self.assertEqual(http.calls,3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list],[1,2])
+
+    @patch.object(common.time,'sleep')
+    def test_rejected_successful_http_response_keeps_safe_status_diagnostic(self,sleep):
+        reply=Reply({'ok':False,'private':'MUST-NOT-APPEAR'},200)
+        http=FakeHTTP(reply,reply,reply)
+        with self.assertRaisesRegex(RuntimeError,r'\(HTTP 200\)$') as caught:
+            common.push_json('https://example.test','/push/news',{},session=http,token='test-only')
+        self.assertNotIn('MUST-NOT-APPEAR',str(caught.exception))
+        self.assertEqual(len(http.calls),3)
+
     def test_large_batches_are_bounded_and_results_accumulate(self):
         http=FakeHTTP(Reply({'ok':True,'saved':300,'duplicates':0,'failed':0,'total':300}),Reply({'ok':True,'saved':299,'duplicates':1,'failed':0,'total':300}))
         result=common.push_json('https://example.test','/push/tdnet',{'items':[{'id':n} for n in range(600)]},session=http,token='test-only')

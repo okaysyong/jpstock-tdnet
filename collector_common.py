@@ -43,8 +43,9 @@ def push_json(base_url,path,payload,session=None,timeout=30,token=None):
                  for part in (body[batch_key][:midpoint],body[batch_key][midpoint:])]
         return dict(ok=True,**{key:sum(result.get(key,0) for result in results)
             for key in ('saved','upserted','inserted','duplicates','skipped','failed','total')})
-    last_error=None
+    last_status=None
     for attempt in range(3):
+        response=None
         try:
             response=client.post(base+path,json=body,headers={'X-Push-Token':token},timeout=timeout,allow_redirects=False)
             if response.status_code not in (200,201):
@@ -56,14 +57,17 @@ def push_json(base_url,path,payload,session=None,timeout=30,token=None):
                 raise RuntimeError('VPS rejected the batch')
             return result
         except (requests.RequestException,ValueError,RuntimeError) as exc:
-            last_error=exc
             code=getattr(getattr(exc,'response',None),'status_code',None)
+            if code is None:
+                code=getattr(response,'status_code',None)
+            last_status=code if type(code) is int and 100<=code<=599 else None
             if code is not None and 400<=code<500:
                 break
             if attempt<2:
                 time.sleep(attempt+1)
     # Do not print response bodies, credential-bearing URLs or request headers.
-    raise RuntimeError('VPS ingestion failed after validation/retry') from None
+    status=f'HTTP {last_status}' if last_status is not None else 'HTTP unavailable'
+    raise RuntimeError(f'VPS ingestion failed after validation/retry ({status})') from None
 
 
 def get_json(base_url,path,session=None,timeout=30):

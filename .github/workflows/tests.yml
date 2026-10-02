@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.lock.txt
-      - name: Verify authenticated VPS endpoint without saving records
+      - name: Verify protected VPS authentication without saving records
         run: python verify_vps_ingest.py
       - name: Collect actual RSS news
         run: python fetch_news_worker.py

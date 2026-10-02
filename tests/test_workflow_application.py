@@ -50,12 +50,28 @@ class WorkflowApplicationTests(unittest.TestCase):
         self.assertFalse(scheduled('stock_news.yml',datetime(2026,10,9,22,7,tzinfo=timezone.utc)))
 
     def test_credential_probe_cannot_insert_records(self):
-        with patch.dict(verify_vps_ingest.os.environ,{'VPS_BASE_URL':'https://example.test'},clear=True),\
-             patch.object(verify_vps_ingest,'push_json',return_value={'ok':True,'saved':0,'total':0}) as push:
+        from types import SimpleNamespace
+        response=SimpleNamespace(status_code=422,json=lambda:{'detail':'Invalid ingest payload'})
+        with patch.dict(verify_vps_ingest.os.environ,{'VPS_BASE_URL':'https://example.test','VPS_PUSH_TOKEN':'test-only'},clear=True),\
+             patch.object(verify_vps_ingest.requests,'post',return_value=response) as push:
             verify_vps_ingest.main()
-        push.assert_called_once_with('https://example.test','/push/kessan',{'items':[]})
-        with patch.object(verify_vps_ingest,'push_json',return_value={'ok':True,'saved':1,'total':1}):
+        self.assertEqual(push.call_args.args,('https://example.test/push/kessan',))
+        self.assertEqual(push.call_args.kwargs['json'],{'items':'authentication-probe-invalid'})
+        self.assertFalse(push.call_args.kwargs['allow_redirects'])
+        for status in (200,401,403,404,503):
+            with patch.dict(verify_vps_ingest.os.environ,{'VPS_PUSH_TOKEN':'test-only'},clear=True),\
+                 patch.object(verify_vps_ingest.requests,'post',return_value=SimpleNamespace(status_code=status)):
+                with self.assertRaises(RuntimeError):verify_vps_ingest.main()
+
+    def test_probe_requires_the_authenticated_validation_contract(self):
+        from types import SimpleNamespace
+        with patch.dict(verify_vps_ingest.os.environ,{'VPS_PUSH_TOKEN':'test-only'},clear=True),\
+             patch.object(verify_vps_ingest.requests,'post',return_value=SimpleNamespace(status_code=422,json=lambda:{'detail':'Expected a JSON object'})):
             with self.assertRaises(RuntimeError):verify_vps_ingest.main()
+        with patch.dict(verify_vps_ingest.os.environ,{},clear=True),\
+             patch.object(verify_vps_ingest.requests,'post') as push:
+            with self.assertRaises(RuntimeError):verify_vps_ingest.main()
+            push.assert_not_called()
 
     def test_application_check_only_uses_main_push_not_pr_secrets(self):
         content=(ROOT/'.github/workflows/tests.yml').read_text(encoding='utf-8')
