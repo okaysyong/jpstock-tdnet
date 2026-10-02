@@ -30,8 +30,31 @@ def _rank(title: str) -> int:
         return 2
     return 1
 
-def fetch_tdnet():
-    now_jst = datetime.now(JST)
+def _confirmed_empty_page(soup, date_str):
+    """Accept only TDnet's dated no-disclosures page, never arbitrary HTML.
+
+    Official template verified on 2026-10-03. Empty days have no
+    main-list-table; their date and explicit message are separate elements.
+    """
+    expected = f'{date_str[:4]}年{date_str[4:6]}月{date_str[6:]}日'
+    title = soup.find('title')
+    header = soup.find(id='kaiji-info-box-top')
+    main = soup.find(id='main-list')
+    dates = soup.find_all(id='kaiji-date-1')
+    messages = soup.find_all(id='kaiji-text-1')
+    return bool(title and title.get_text(strip=True) == '適時開示情報閲覧サービス - 開示情報一覧'
+                and soup.find(id='list-body-box') and header and main
+                and len(dates) == 1 and len(messages) == 1
+                and header.find(id='kaiji-date-1') is dates[0]
+                and header.find(id='kaiji-text-1') is messages[0]
+                and dates[0].get_text(strip=True) == expected
+                and messages[0].get_text(strip=True) == 'に開示された情報はありません。'
+                and not main.get_text(strip=True) and not main.find(['table', 'a', 'iframe'])
+                and soup.find(id='main-list-table') is None)
+
+
+def fetch_tdnet(now=None):
+    now_jst = (now or datetime.now(JST)).astimezone(JST)
     date_str = now_jst.strftime("%Y%m%d")
     items = []
 
@@ -40,6 +63,8 @@ def fetch_tdnet():
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code == 404:
+                if page == 1:
+                    raise RuntimeError('TDnet first page unavailable')
                 break
             r.raise_for_status()
             r.encoding = 'utf-8'
@@ -48,6 +73,9 @@ def fetch_tdnet():
             # main-list-table에서 공시 파싱
             main_tbl = soup.find('table', id='main-list-table')
             if not main_tbl:
+                if page == 1 and not items and _confirmed_empty_page(soup, date_str):
+                    print(f'  TDnet {date_str}: confirmed no disclosures')
+                    return []
                 raise RuntimeError('TDnet table not found')
 
             page_count = 0
@@ -80,6 +108,8 @@ def fetch_tdnet():
                     "pdf_url": link,
                 })
                 page_count += 1
+            if page_count == 0:
+                raise RuntimeError('TDnet table contained no valid disclosures')
             print(f"  페이지 {page}: {page_count}건")
             if page_count < 50:
                 break
