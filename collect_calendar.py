@@ -1,6 +1,6 @@
 """Economic calendar collector; import is side-effect free."""
 from collector_common import push_json, event_identity
-from event_normalization import canonical_record_fields, parse_nikkei_schedule, COMPARISON_FIELDS
+from event_normalization import canonical_record_fields, parse_nikkei_schedule, COMPARISON_FIELDS, is_boj_policy_event
 from datetime import datetime, timedelta, timezone
 import math
 import re
@@ -101,14 +101,21 @@ def build_payload(nikkei_events, ff_items, now=None):
         if not str(item['title']).strip():
             continue
         try:
-            due = datetime.fromisoformat(item['date'] + 'T' + item['time']).replace(tzinfo=JST)
+            policy = is_boj_policy_event(item)
+            due = (None if policy else
+                   datetime.fromisoformat(item['date'] + 'T' + item['time']).replace(tzinfo=JST))
             fields = canonical_record_fields(item, candidates)
         except (ValueError, TypeError):
             continue
         # A scraped old result accidentally paired with a future release cannot
         # become a result announcement. The original source can update after due.
-        if due > now:
+        if (due is not None and due > now) or item['date'] > now.date().isoformat():
             item['actual'] = None
+        if policy:
+            # The VPS still requires an official same-day schedule before it
+            # accepts this result. A calendar's guessed noon is not a deadline.
+            item['release_time_unknown'] = True
+            fields['scheduled_at'] = None
         item.update(fields)
         item['observed_at'] = observed_at
         item['result_status'] = ('schedule_only' if not item['source_actual_capable'] else

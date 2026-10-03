@@ -14,7 +14,19 @@ EMPTY_VALUES = {'', '-', '--', '—', '–', '−', '―', 'ー', 'n/a', 'na', '
 COMPARISON_FIELDS = ('unit', 'actual_unit', 'forecast_unit', 'previous_unit',
     'actual_period', 'forecast_period', 'previous_period', 'actual_basis',
     'forecast_basis', 'previous_basis', 'previous_revised', 'previous_original',
-    'previous_kind', 'source_url', 'forecast_source', 'previous_source')
+    'previous_kind', 'source_url', 'forecast_source', 'previous_source',
+    'release_time_unknown', 'official_schedule_date_verified')
+
+
+def is_boj_policy_event(event):
+    """Policy decision only; minutes, opinions and speeches have separate clocks."""
+    if normalize_country(event.get('country') or event.get('currency')) != 'JP':
+        return False
+    title = _text(event.get('title_jp') or event.get('title'))
+    if re.search(r'議事|主な意見|記者会見|講演|展望|レポート|見通し|minutes|opinions|speech|press conference|outlook|report',title):
+        return False
+    return bool(re.search(r'日銀|日本銀行|\bboj\b|bank of japan',title) and
+                re.search(r'政策金利|政策決定|政策会合|rate decision|policy decision|monetary policy meeting',title))
 
 
 def normalized_value(value):
@@ -172,6 +184,9 @@ def merge_events(rows):
         event = dict(original)
         fields = canonical_record_fields(event, rows)
         event.update(fields)
+        if event.get('release_time_unknown') is True:
+            event['scheduled_at'] = None
+            event['event_time'] = ''
         actual = normalized_value(event.get('actual'))
         event['actual'] = (event['actual'] if actual is not None and isinstance(event.get('actual'), (int,float)) else actual)
         event['forecast'] = normalized_value(event.get('forecast'))
@@ -229,10 +244,7 @@ def parse_nikkei_schedule(html, now=None):
             continue
         clock_cell = row.find('td', class_='time')
         match = re.fullmatch(r'(\d{1,2}):(\d{2})', _text(clock_cell.get_text(strip=True) if clock_cell else ''))
-        if not match or int(match[1]) > 47 or int(match[2]) > 59:
-            continue
-        event_day = day + timedelta(days=int(match[1])//24)
-        clock = f'{int(match[1])%24:02d}:{int(match[2]):02d}'
+        clock_text = _text(clock_cell.get_text(strip=True) if clock_cell else '')
         country = None
         for flag in event_cell.find_all(class_=True):
             for css in flag.get('class', []):
@@ -241,6 +253,14 @@ def parse_nikkei_schedule(html, now=None):
                     break
         if not country:
             continue  # Never assume Japan when the source flag is unrecognized.
+        policy = is_boj_policy_event({'country':country,'title':title})
+        if not match or int(match[1]) > 47 or int(match[2]) > 59:
+            if not policy or clock_text not in ('','未定','時間未定','--:--','tentative','tba'):
+                continue
+            event_day, clock = day, ''
+        else:
+            event_day = day + timedelta(days=int(match[1])//24)
+            clock = f'{int(match[1])%24:02d}:{int(match[2]):02d}'
         priority = row.find('td', class_='priority')
         stars = priority.get_text().count('★') if priority else 0
         if stars < 1:
@@ -259,5 +279,7 @@ def parse_nikkei_schedule(html, now=None):
             'result_status':'reported' if actual is not None else 'awaiting',
             'observed_at':now.astimezone(timezone.utc).isoformat()}
         event.update(qualifiers)
+        if policy:
+            event['release_time_unknown'] = True
         events.append(event)
     return events

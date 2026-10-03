@@ -132,6 +132,18 @@ class CalendarCanonicalMergeTests(unittest.TestCase):
         self.assertEqual(item['source_url'],'https://nikkei225jp.com/schedule/')
         self.assertEqual(item['previous_period'],'2026-08')
 
+    def test_boj_actual_unknown_clock_and_before_noon_reach_official_date_verifier(self):
+        for clock in ('','12:00'):
+            row=nikkei('日銀政策金利','1.0%',clock=clock,currency='JPY')
+            row['release_time_unknown']=True
+            item=self.build([row],[],datetime.fromisoformat('2026-10-02T11:50:00+09:00'))[0]
+            self.assertEqual(item['actual'],'1.0%')
+            self.assertTrue(item['release_time_unknown'])
+            # A source flag never becomes proof of the official meeting date.
+            self.assertNotIn('official_schedule_date_verified',item)
+        item=self.build([row],[],datetime.fromisoformat('2026-10-01T11:50:00+09:00'))[0]
+        self.assertIsNone(item['actual'])
+
 
 if __name__ == '__main__':
     unittest.main()
