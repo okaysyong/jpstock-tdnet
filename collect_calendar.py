@@ -1,6 +1,6 @@
 """Economic calendar collector; import is side-effect free."""
 from collector_common import push_json, event_identity
-from event_normalization import canonical_record_fields
+from event_normalization import canonical_record_fields, parse_nikkei_schedule, COMPARISON_FIELDS
 from datetime import datetime, timedelta, timezone
 import math
 import re
@@ -71,13 +71,15 @@ def build_payload(nikkei_events, ff_items, now=None):
     observed_at = now.astimezone(timezone.utc).isoformat(timespec='seconds')
     candidates = []
     for event in nikkei_events:
-        candidates.append({
+        candidate = {
             'title': event['title'], 'currency': event['currency'], 'source': 'nikkei225jp',
             'impact': 'High' if event['stars'] >= 4 else 'Medium', 'stars': event['stars'],
             'date': event['date'], 'time': event['time'], 'forecast': event.get('forecast'),
             'previous': event.get('previous'), 'actual': normalize_actual(event.get('actual')),
             'source_actual_capable': True,
-        })
+        }
+        candidate.update({k: event[k] for k in COMPARISON_FIELDS if k in event})
+        candidates.append(candidate)
     for event in ff_items:
         if not isinstance(event, dict) or event.get('country') not in ('USD', 'JPY'):
             continue
@@ -143,66 +145,13 @@ def main(include_forexfactory=True):
         r = requests.get("https://nikkei225jp.com/schedule/", headers=headers, timeout=15)
         print(f"nikkei225jp: {r.status_code}")
         if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            main_table = next((t for t in soup.find_all("table") if len(t.find_all("tr")) > 10), None)
-            if main_table:
-                successful_sources += 1
-                current_date = None
-                for row in main_table.find_all("tr"):
-                    cells = row.find_all(["td","th"])
-                    texts = [c.get_text(strip=True) for c in cells]
-                    if not texts: continue
-                    # 날짜 행
-                    if len(texts) == 1 and re.match(r'\d+/\d+', texts[0]):
-                        m = re.match(r'(\d+)/(\d+)', texts[0])
-                        if m:
-                            month,day=int(m.group(1)),int(m.group(2))
-                            candidates=[]
-                            for candidate_year in (year-1,year,year+1):
-                                try:
-                                    candidates.append(datetime(candidate_year,month,day,tzinfo=JST))
-                                except ValueError:
-                                    pass
-                            current_date=min(candidates,key=lambda d:abs((d-now).days)).strftime('%Y-%m-%d')
-                        continue
-                    # 데이터 행
-                    if len(texts) >= 6 and re.match(r'\d+:\d+', texts[0]) and current_date:
-                        source_stars = texts[1].count("★")
-                        if source_stars < 2: continue
-                        stars = normalize_stars(source_stars)
-                        try:
-                            event_date, event_time = normalize_schedule_time(current_date, texts[0])
-                        except ValueError:
-                            continue
-    
-                        # flag 클래스로 국가 판단
-                        span = cells[2].find("span", class_=re.compile(r"flag1-")) if len(cells) > 2 else None
-                        flag = ""
-                        if span:
-                            for cls in span.get("class", []):
-                                if cls.startswith("flag1-"):
-                                    flag = cls.replace("flag1-", "")
-                                    break
-    
-                        # 포함 기준:
-                        # JP/US → ★2 이상 전부
-                        # EU(ECB) → ★5만 (ECB금리 등)
-                        # 나머지(GB/DE/AU/CN 등) → 제외
-                        if flag == "jp":
-                            currency = "JPY"
-                        elif flag == "us":
-                            currency = "USD"
-                        elif flag in ("eu",) and stars >= 5:
-                            currency = "EUR"
-                        else:
-                            continue
-    
-                        nk_events.append({
-                            "date": event_date, "time": event_time,
-                            "title": texts[2], "actual": normalize_actual(texts[3]),
-                            "forecast": texts[4], "previous": texts[5],
-                            "currency": currency, "stars": stars,
-                        })
+            parsed = parse_nikkei_schedule(r.text, now)
+            successful_sources += 1
+            currencies = {'JP': 'JPY', 'US': 'USD', 'EU': 'EUR'}
+            nk_events = [dict(event, currency=currencies[event['country']])
+                         for event in parsed
+                         if ((event['country'] in ('JP', 'US') and event['stars'] >= 2)
+                             or (event['country'] == 'EU' and event['stars'] >= 5))]
     
             usd = sum(1 for e in nk_events if e["currency"]=="USD")
             jpy = sum(1 for e in nk_events if e["currency"]=="JPY")

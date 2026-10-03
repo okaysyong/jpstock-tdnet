@@ -19,12 +19,12 @@ spec.loader.exec_module(calendar)
 
 
 def nikkei_row(clock, stars, title, actual, flag='us'):
-    return f'''<tr><td>{clock}</td><td>{stars}</td>
-    <td><span class="flag1-{flag}"></span>{title}</td>
-    <td>{actual}</td><td>forecast</td><td>previous</td></tr>'''
+    return f'''<tr><td class="time">{clock}</td><td class="priority">{stars}</td>
+    <td class="event"><span class="flag1-{flag}"></span>{title}</td>
+    <td class="result">{actual}</td><td class="expectation">forecast</td><td class="last">previous</td></tr>'''
 
 
-NIKKEI_FIXTURE = '<table><tr><td>10/7</td></tr>' + ''.join([
+NIKKEI_FIXTURE = '<table id="SihyoT"><tr><td class="date">10/7</td></tr>' + ''.join([
     # The original source day's 27:00 is the following day's 03:00 JST.
     nikkei_row('27:00', '★★★★', '09月 FOMC議事録', '未発表'),
     nikkei_row('9:00', '★★★★★★★', '日本 GDP', '0', flag='jp'),

@@ -120,6 +120,18 @@ class CalendarCanonicalMergeTests(unittest.TestCase):
         en = ff('Tokyo Core CPI y/y', country='JPY', date='2026-10-01T23:30:00Z')
         self.assertEqual(len(self.build([jp, previous], [en])), 3)
 
+    def test_comparison_revision_and_source_metadata_survive_payload(self):
+        source = dict(nikkei('09月 雇用統計（失業率）', '4.2%'),
+            previous_revised=True,previous_original='4.3%',previous='4.1%',
+            source_url='https://nikkei225jp.com/schedule/',actual_unit='%',forecast_unit='%',
+            previous_unit='%',previous_period='2026-08')
+        item = self.build([source])[0]
+        self.assertEqual(item['previous'],'4.1%')
+        self.assertEqual(item['previous_original'],'4.3%')
+        self.assertTrue(item['previous_revised'])
+        self.assertEqual(item['source_url'],'https://nikkei225jp.com/schedule/')
+        self.assertEqual(item['previous_period'],'2026-08')
+
 
 if __name__ == '__main__':
     unittest.main()

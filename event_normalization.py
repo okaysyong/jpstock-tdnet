@@ -11,6 +11,10 @@ COUNTRIES = {'USD':'US','JPY':'JP','EUR':'EU','GBP':'GB','AUD':'AU','CNY':'CN',
 EMPTY_VALUES = {'', '-', '--', '—', '–', '−', '―', 'ー', 'n/a', 'na', 'none', 'null', 'nan',
                 '未発表', '未公表', '未定', '発表待ち', '発表前', 'pending', 'tba',
                 'not released', 'not yet released'}
+COMPARISON_FIELDS = ('unit', 'actual_unit', 'forecast_unit', 'previous_unit',
+    'actual_period', 'forecast_period', 'previous_period', 'actual_basis',
+    'forecast_basis', 'previous_basis', 'previous_revised', 'previous_original',
+    'previous_kind', 'source_url', 'forecast_source', 'previous_source')
 
 
 def normalized_value(value):
@@ -127,6 +131,40 @@ def observed_iso(value, fallback=None):
         return fallback
 
 
+def calendar_cell(cell, previous=False):
+    """Keep one reported value; explicit crossed-out/arrow revisions stay separate.
+
+    Multiple unlabelled values are not a basis for guessing which is current.
+    In particular get_text(strip=True) must not turn 16.2 + 15.6 into 16.215.6.
+    """
+    if cell is None:
+        return None, {}
+    single = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*[^\d\s()（）→⇒]*'
+    text = unicodedata.normalize('NFKC', cell.get_text(' ', strip=True)).strip()
+    if previous:
+        deleted = cell.find_all(['del', 's', 'strike'])
+        if len(deleted) == 1:
+            original = normalized_value(deleted[0].get_text(' ', strip=True))
+            from bs4 import BeautifulSoup
+            cleaned = BeautifulSoup(str(cell), 'html.parser')
+            for node in cleaned.find_all(['del', 's', 'strike']):
+                node.decompose()
+            current = normalized_value(cleaned.get_text(' ', strip=True))
+            if original and current and re.fullmatch(single, original) and re.fullmatch(single, current):
+                return current, {'previous_revised': True, 'previous_original': original}
+            return None, {'previous_kind': 'ambiguous'}
+        arrow = re.fullmatch(r'\s*(' + single + r')\s*[→⇒]\s*(' + single + r')\s*', text)
+        if arrow:
+            return arrow[2].strip(), {'previous_revised': True, 'previous_original': arrow[1].strip()}
+    value = normalized_value(text)
+    numeric = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
+    known_range = value and re.fullmatch(numeric + r'\s*[-~–～]\s*' + numeric + r'[^\d\s()（）]*', value)
+    if value and ((len(re.findall(numeric, value)) > 1 and not known_range) or
+                  re.search(r'[→⇒]|修正', value)):
+        return None, {'previous_kind': 'ambiguous'} if previous else {}
+    return value, {}
+
+
 def merge_events(rows):
     rows = [dict(row) for row in rows]
     grouped = {}
@@ -205,16 +243,21 @@ def parse_nikkei_schedule(html, now=None):
             continue  # Never assume Japan when the source flag is unrecognized.
         priority = row.find('td', class_='priority')
         stars = priority.get_text().count('★') if priority else 0
-        if not 1 <= stars <= 5:
+        if stars < 1:
             continue
+        stars = min(stars, 5)
         def cell_value(*names):
             cell = next((row.find('td', class_=name) for name in names if row.find('td', class_=name)), None)
-            return normalized_value(cell.get_text(strip=True)) if cell else None
-        actual = cell_value('result')
-        events.append({'date':str(event_day), 'time':clock, 'country':country,
+            return calendar_cell(cell, previous=names[0] == 'last')
+        actual, _ = cell_value('result')
+        previous, qualifiers = cell_value('last','previous')
+        event = {'date':str(event_day), 'time':clock, 'country':country,
             'title':title, 'title_jp':title, 'source':'nikkei225jp', 'stars':stars,
-            'actual':actual, 'forecast':cell_value('expectation','forecast'),
-            'previous':cell_value('last','previous'), 'source_actual_capable':True,
+            'source_url':'https://nikkei225jp.com/schedule/',
+            'actual':actual, 'forecast':cell_value('expectation','forecast')[0],
+            'previous':previous, 'source_actual_capable':True,
             'result_status':'reported' if actual is not None else 'awaiting',
-            'observed_at':now.astimezone(timezone.utc).isoformat()})
+            'observed_at':now.astimezone(timezone.utc).isoformat()}
+        event.update(qualifiers)
+        events.append(event)
     return events
