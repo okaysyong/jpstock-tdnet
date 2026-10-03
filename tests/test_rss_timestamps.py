@@ -24,6 +24,7 @@ def load_module(name):
 
 
 timestamp = load_module("rss_timestamp")
+policy = load_module("news_collection_policy")
 with patch.dict(sys.modules, {"rss_timestamp": timestamp}):
     news = load_module("collect_news")
 
@@ -138,7 +139,9 @@ class RssTimestampTests(unittest.TestCase):
             captured.append((path, payload)) or {"ok": True, "saved": len(payload["items"])}
         )
         response = types.SimpleNamespace(status_code=response_status, text="mock RSS")
-        with patch.dict(sys.modules, {"collector_common": common, "rss_timestamp": timestamp}), \
+        with patch.dict(sys.modules, {"collector_common": common, "rss_timestamp": timestamp,
+                                    "news_collection_policy": policy}), \
+             patch.object(policy, "datetime", FrozenDateTime), \
              patch.object(requests, "get", return_value=response), \
              patch.object(feedparser, "parse", side_effect=feeds), \
              patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
@@ -147,13 +150,13 @@ class RssTimestampTests(unittest.TestCase):
 
     def test_worker_skips_bad_dates_but_keeps_contract_and_valid_duplicate(self):
         entries = [
-            {"title": "Nikkei primary", "published": "2026-10-01T22:00:00Z",
+            {"title": "Toyota earnings primary", "link": "https://example.test/primary", "published": "2026-10-01T22:00:00Z",
              "updated": "2026-10-02T02:00:00Z"},
-            {"title": "Nikkei updated", "published": "bad", "updated": "2026-10-01T23:00:00Z"},
-            {"title": "Nikkei missing"},
-            {"title": "Nikkei broken", "published": "bad"},
-            {"title": "Nikkei repeat", "published": "bad"},
-            {"title": "Nikkei repeat", "published_parsed": (2026, 10, 2, 0, 0, 0)},
+            {"title": "Toyota earnings updated", "link": "https://example.test/updated", "published": "bad", "updated": "2026-10-01T23:00:00Z"},
+            {"title": "Toyota earnings missing"},
+            {"title": "Toyota earnings broken", "published": "bad"},
+            {"title": "Toyota earnings repeat", "link": "https://example.test/repeat", "published": "bad"},
+            {"title": "Toyota earnings repeat", "link": "https://example.test/repeat", "published_parsed": (2026, 10, 2, 0, 0, 0)},
         ]
         feeds = [types.SimpleNamespace(bozo=False, entries=entries)]
         feeds += [types.SimpleNamespace(bozo=False, entries=[]) for _ in range(4)]
@@ -164,8 +167,9 @@ class RssTimestampTests(unittest.TestCase):
         self.assertEqual([item["published_at"] for item in payload["items"]], [
             "2026-10-02 07:00:00", "2026-10-02 08:00:00", "2026-10-02 09:00:00"
         ])
-        self.assertEqual(payload["items"][0]["uid"], hashlib.md5(b"nhk_eco:Nikkei primary").hexdigest()[:16])
-        self.assertTrue(all(item["source"] == "nhk_eco" and item["score"] == 4
+        self.assertEqual(payload["items"][0]["uid"], policy.news_uid(
+            "https://example.test/primary", "Toyota earnings primary", "2026-10-02 07:00:00"))
+        self.assertTrue(all(item["source"] == "nhk_eco" and item["score"] == 1.0
                             for item in payload["items"]))
 
     def test_worker_all_source_failures_remain_failures(self):

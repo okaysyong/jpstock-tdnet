@@ -1,6 +1,8 @@
 import requests, feedparser, json, time, hashlib, os
 from datetime import datetime, timezone, timedelta
-from rss_timestamp import publication_time_jst
+from news_collection_policy import (
+    clean_text, news_uid, normalize_score, publication_time, relevance,
+)
 
 JST = timezone(timedelta(hours=9))
 VPS_URL = os.environ.get("VPS_URL", "https://jpstocklive.com")
@@ -90,34 +92,36 @@ for source, url in RSS_FEEDS:
             title = (entry.get("title") or "").strip()
             if not title:
                 continue
-            if any(kw in title for kw in EXCLUDE_KW):
+            # A generic market word is not a Japanese-equity connection.
+            reason, stocks = relevance(title)
+            if reason == "no_verified_japan_equity_link":
                 continue
-            if source.startswith("cnbc"):
-                if not any(kw in title for kw in HIGH_KW + MEDIUM_KW):
-                    continue
             if any(kw in title for kw in HIGH_KW):
                 score = 4
             elif any(kw in title for kw in MEDIUM_KW):
                 score = 3
             else:
                 score = 2
-            if source == "yahoo_biz" and score <= 2:
+            published_dt = publication_time(entry)
+            if published_dt is None:
                 continue
-            uid = hashlib.md5(f"{source}:{title}".encode()).hexdigest()[:16]
+            published = published_dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+            link = entry.get("link") or ""
+            uid = news_uid(link, title, published)
+            if uid == "news_":
+                continue
             if uid in seen_uids:
-                continue
-            published = publication_time_jst(entry)
-            if published is None:
                 continue
             seen_uids.add(uid)
             all_news.append({
                 "uid":          uid,
                 "title":        title,
-                "summary":      (entry.get("summary") or "")[:300],
-                "url":          entry.get("link") or "",
+                "summary":      clean_text(entry.get("summary"))[:300],
+                "url":          link,
                 "source":       source,
                 "published_at": published,
-                "score":        score,
+                "stocks":       stocks,
+                "score":        normalize_score(score),
             })
             count += 1
         print(f"OK {source}: {count}")
@@ -128,9 +132,9 @@ for source, url in RSS_FEEDS:
 all_news.sort(key=lambda x: -x.get("score", 2))
 
 print(f"Total: {len(all_news)}")
-print(f"  HIGH(4): {len([x for x in all_news if x['score']==4])}")
-print(f"  MED (3): {len([x for x in all_news if x['score']==3])}")
-print(f"  LOW (2): {len([x for x in all_news if x['score']==2])}")
+print(f"  HIGH(1.0): {len([x for x in all_news if x['score']==1.0])}")
+print(f"  MED (.75): {len([x for x in all_news if x['score']==0.75])}")
+print(f"  LOW (.5): {len([x for x in all_news if x['score']==0.5])}")
 
 if not all_news:
     if not successful_sources:
