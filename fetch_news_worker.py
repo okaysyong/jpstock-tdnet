@@ -2,6 +2,7 @@ import requests, feedparser, json, time, hashlib, os
 from datetime import datetime, timezone, timedelta
 from news_collection_policy import (
     clean_text, news_uid, normalize_score, publication_time, relevance,
+    PRIMARY_FEEDS, article_url, publisher_name,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -15,6 +16,7 @@ RSS_FEEDS = [
     ("cnbc_fin",   "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
     ("yahoo_biz",  "https://news.yahoo.co.jp/rss/categories/business.xml"),
 ]
+RSS_FEEDS.extend(PRIMARY_FEEDS)
 
 EXCLUDE_KW = [
     "サッカー","野球","バスケ","テニス","ゴルフ","ラグビー","五輪",
@@ -93,7 +95,9 @@ for source, url in RSS_FEEDS:
             if not title:
                 continue
             # A generic market word is not a Japanese-equity connection.
-            reason, stocks = relevance(title)
+            link = article_url(entry.get('link'))
+            summary = clean_text(entry.get('summary'))[:300]
+            reason, stocks = relevance(title, source_url=link, summary=summary)
             if reason == "no_verified_japan_equity_link":
                 continue
             if any(kw in title for kw in HIGH_KW):
@@ -106,7 +110,6 @@ for source, url in RSS_FEEDS:
             if published_dt is None:
                 continue
             published = published_dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
-            link = entry.get("link") or ""
             uid = news_uid(link, title, published)
             if uid == "news_":
                 continue
@@ -116,9 +119,9 @@ for source, url in RSS_FEEDS:
             all_news.append({
                 "uid":          uid,
                 "title":        title,
-                "summary":      clean_text(entry.get("summary"))[:300],
+                "summary":      summary,
                 "url":          link,
-                "source":       source,
+                "source":       publisher_name(entry, source),
                 "published_at": published,
                 "stocks":       stocks,
                 "score":        normalize_score(score),

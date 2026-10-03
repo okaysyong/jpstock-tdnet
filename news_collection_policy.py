@@ -13,6 +13,37 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 JST = timezone(timedelta(hours=9))
 
+# Official RSS links published by each organisation, checked 2026-10-03.
+# A feed is a source of candidates, never permission to broadcast every release.
+PRIMARY_FEEDS = (
+    ('jpx_official', 'https://www.jpx.co.jp/rss/markets_news.xml'),
+    ('boj_official', 'https://www.boj.or.jp/rss/whatsnew.xml'),
+    ('toyota_official', 'https://global.toyota/export/jp/allnews_rss.xml'),
+)
+
+
+def article_url(value):
+    """BOJ's own HTTPS RSS still contains HTTP links on its same official host."""
+    value = str(value or '')
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme == 'http' and parsed.hostname in {'www.boj.or.jp', 'boj.or.jp'}
+                and not parsed.username and not parsed.password and parsed.port in (None, 80)):
+            return urlunsplit(('https', parsed.hostname, parsed.path, parsed.query, parsed.fragment))
+    except ValueError:
+        return ''
+    return value
+
+
+def publisher_name(entry, default):
+    """Keep an original syndication publisher when supplied, not just yahoo_biz."""
+    source = entry.get('source') or {}
+    if hasattr(source, 'get'):
+        original = clean_text(source.get('title'))
+        if original:
+            return original[:80]
+    return str(default)[:2048]
+
 # Curated unambiguous aliases; a missing company is withheld, never guessed.
 ISSUERS = {
     "7203": ("トヨタ", "Toyota"), "6758": ("ソニー", "Sony"),
@@ -73,9 +104,22 @@ def _match(text, phrase):
     return phrase in text
 
 
-def relevance(title, aliases=None):
+def relevance(title, aliases=None, *, source_url='', summary=''):
     """Return (reason, codes); no probability, cause, or inferred sector claims."""
     title = unicodedata.normalize("NFKC", clean_text(title))
+    try:
+        parsed = urlsplit(article_url(source_url))
+        host = parsed.hostname if parsed.scheme == 'https' and not parsed.username and not parsed.password else ''
+    except ValueError:
+        host = ''
+    if host in {'global.toyota', 'www.boj.or.jp', 'boj.or.jp', 'www.jpx.co.jp', 'jpx.co.jp'}:
+        content = title + ' ' + clean_text(summary)[:1200]
+        if host == 'global.toyota' and any(_match(content, word) for word in MATERIAL_EVENTS):
+            return 'official_issuer_material_event', ['7203']
+        macro = (r'金融政策|政策金利|国債買入|短観|展望レポート|主な意見' if 'boj.or.jp' in host
+                 else r'売買停止|売買再開|上場廃止|取引制度|指数.*(?:構成|銘柄|変更)' if 'jpx.co.jp' in host else r'(?!)')
+        if re.search(macro, content):
+            return 'official_japan_market_fact', []
     registry = dict(ISSUERS)
     for code, names in (aliases or {}).items():
         if re.fullmatch(r"[0-9A-Z]{4,5}", str(code)):
